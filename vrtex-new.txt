@@ -1,78 +1,277 @@
-[custom]
-;不要随意改变关键字，否则会导致出错
-;acl4SSR规则
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
 
-;去广告：支持
-;自动测速：支持
-;微软分流：支持
-;苹果分流：支持
-;增强中国IP段：支持
-;增强国外GFW：支持
+proxy-groups:
+  - name: "🚀 节点选择"
+    type: select
+    proxies:
+      - "♻️ 自动选择"
+      - "🔯 故障转移"
+      - "🔮 负载均衡"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+      - "DIRECT"
 
-;设置规则标志位
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/LocalAreaNetwork.list
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/UnBan.list
-ruleset=🛑 广告拦截,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanAD.list
-ruleset=🍃 应用净化,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanProgramAD.list
-ruleset=📢 谷歌FCM,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleFCM.list
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GoogleCN.list
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/SteamCN.list
-ruleset=Ⓜ️ 微软Bing,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Bing.list
-ruleset=Ⓜ️ 微软云盘,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/OneDrive.list
-ruleset=Ⓜ️ 微软服务,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Microsoft.list
-ruleset=🍎 苹果服务,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Apple.list
-ruleset=📲 电报消息,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Telegram.list
-ruleset=💬 Ai平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/AI.list
-ruleset=💬 Ai平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/OpenAi.list
-ruleset=🎶 网易音乐,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/NetEaseMusic.list
-ruleset=🎮 游戏平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Epic.list
-ruleset=🎮 游戏平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Origin.list
-ruleset=🎮 游戏平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Sony.list
-ruleset=🎮 游戏平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Steam.list
-ruleset=🎮 游戏平台,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Nintendo.list
-ruleset=📹 油管视频,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/YouTube.list
-ruleset=📺 哔哩哔哩,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/BilibiliHMT.list
-ruleset=📺 哔哩哔哩,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Bilibili.list
-ruleset=🌏 国内媒体,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaMedia.list
-ruleset=🌍 国外媒体,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ProxyMedia.list
-ruleset=🚀 节点选择,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ProxyGFWlist.list
-;ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaIp.list
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaDomain.list
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaCompanyIp.list
-ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Download.list
-;ruleset=🎯 全球直连,[]GEOIP,LAN
-ruleset=🎯 全球直连,[]GEOIP,CN
-ruleset=🐟 漏网之鱼,[]FINAL
-;设置规则标志位
+  - name: "🚀 手动切换"
+    type: select
+    include-all: true
+    filter: ".*"
 
-;设置分组标志位
-custom_proxy_group=🚀 节点选择`select`[]♻️ 自动选择`[]🔯 故障转移`[]🔮 负载均衡`[]🇺🇲 美国节点`[]🚀 手动切换`[]DIRECT
-custom_proxy_group=🚀 手动切换`select`.*
-custom_proxy_group=♻️ 自动选择`url-test`.*`http://www.gstatic.com/generate_204`300,,50
-custom_proxy_group=🔯 故障转移`fallback`.*`http://www.gstatic.com/generate_204`300,,50
-custom_proxy_group=🔮 负载均衡`load-balance`.*`http://www.gstatic.com/generate_204`300,,50
-custom_proxy_group=📲 电报消息`select`[]🚀 节点选择`[]♻️ 自动选择`[]🇺🇲 美国节点`[]🚀 手动切换`[]DIRECT
-custom_proxy_group=💬 Ai平台`select`(isp|ISP)`[]🚀 节点选择`[]♻️ 自动选择`[]🇺🇲 美国节点`[]🚀 手动切换`[]DIRECT
-custom_proxy_group=📹 油管视频`select`[]🚀 节点选择`[]♻️ 自动选择`[]🇺🇲 美国节点`[]🚀 手动切换`[]DIRECT
-custom_proxy_group=🌍 国外媒体`select`[]🚀 节点选择`[]♻️ 自动选择`[]🇺🇲 美国节点`[]🚀 手动切换`[]DIRECT
-custom_proxy_group=🌏 国内媒体`select`[]DIRECT`[]🚀 节点选择
-custom_proxy_group=📢 谷歌FCM`select`[]DIRECT`[]🚀 节点选择`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=Ⓜ️ 微软Bing`select`[]DIRECT`[]🚀 节点选择`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=Ⓜ️ 微软云盘`select`[]DIRECT`[]🚀 节点选择`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=Ⓜ️ 微软服务`select`[]DIRECT`[]🚀 节点选择`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=🍎 苹果服务`select`[]DIRECT`[]🚀 节点选择`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=📺 哔哩哔哩`select`[]🎯 全球直连`[]🚀 节点选择
-custom_proxy_group=🎮 游戏平台`select`[]DIRECT`[]🚀 节点选择`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=🎶 网易音乐`select`[]DIRECT`[]🚀 节点选择`(网易|音乐|解锁|Music|NetEase)
-custom_proxy_group=🛑 广告拦截`select`[]REJECT`[]DIRECT
-custom_proxy_group=🍃 应用净化`select`[]REJECT`[]DIRECT
-custom_proxy_group=🐟 漏网之鱼`select`[]🚀 节点选择`[]♻️ 自动选择`[]DIRECT`[]🇺🇲 美国节点`[]🚀 手动切换
-custom_proxy_group=🇺🇲 美国节点`url-test`(美国节点|myself|isp|ISP)`http://www.gstatic.com/generate_204`300,,150
-;设置分组标志位
+  - name: "♻️ 自动选择"
+    type: url-test
+    include-all: true
+    filter: ".*"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
 
-enable_rule_generator=true
-overwrite_original_rules=true
+  - name: "🔯 故障转移"
+    type: fallback
+    include-all: true
+    filter: ".*"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
 
-;clash_rule_base=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GeneralClashConfig.yml
+  - name: "🔮 负载均衡"
+    type: load-balance
+    include-all: true
+    filter: ".*"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
 
-;luck
+  - name: "📲 电报消息"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "♻️ 自动选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+      - "DIRECT"
+
+  - name: "💬 Ai平台"
+    type: select
+    include-all: true
+    filter: "(isp|ISP)"
+    proxies:
+      - "🚀 节点选择"
+      - "♻️ 自动选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+      - "DIRECT"
+
+  - name: "📹 油管视频"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "♻️ 自动选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+      - "DIRECT"
+
+  - name: "🌍 国外媒体"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "♻️ 自动选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+      - "DIRECT"
+
+  - name: "🌏 国内媒体"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+
+  - name: "📢 谷歌FCM"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "Ⓜ️ 微软Bing"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "Ⓜ️ 微软云盘"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "Ⓜ️ 微软服务"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "🍎 苹果服务"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "📺 哔哩哔哩"
+    type: select
+    proxies:
+      - "🎯 全球直连"
+      - "🚀 节点选择"
+
+  - name: "🎮 游戏平台"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "🎶 网易音乐"
+    type: select
+    include-all: true
+    filter: "(网易|音乐|解锁|Music|NetEase)"
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+
+  - name: "🎯 全球直连"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
+      - "♻️ 自动选择"
+
+  - name: "🛑 广告拦截"
+    type: select
+    proxies:
+      - "REJECT"
+      - "DIRECT"
+
+  - name: "🍃 应用净化"
+    type: select
+    proxies:
+      - "REJECT"
+      - "DIRECT"
+
+  - name: "🐟 漏网之鱼"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "♻️ 自动选择"
+      - "DIRECT"
+      - "🇺🇲 美国节点"
+      - "🚀 手动切换"
+
+  - name: "🇺🇲 美国节点"
+    type: url-test
+    include-all: true
+    filter: "(美国节点|myself|isp|ISP)"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 150
+
+rule-providers:
+  LocalAreaNetwork:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/LocalAreaNetwork.list"}
+  UnBan:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/UnBan.list"}
+  BanAD:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanAD.list"}
+  BanProgramAD:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanProgramAD.list"}
+  GoogleFCM:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleFCM.list"}
+  GoogleCN:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GoogleCN.list"}
+  SteamCN:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/SteamCN.list"}
+  Bing:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Bing.list"}
+  OneDrive:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/OneDrive.list"}
+  Microsoft:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Microsoft.list"}
+  Apple:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Apple.list"}
+  Telegram:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Telegram.list"}
+  AI:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/AI.list"}
+  OpenAi:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/OpenAi.list"}
+  NetEaseMusic:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/NetEaseMusic.list"}
+  Epic:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Epic.list"}
+  Origin:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Origin.list"}
+  Sony:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Sony.list"}
+  Steam:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Steam.list"}
+  Nintendo:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Nintendo.list"}
+  YouTube:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/YouTube.list"}
+  BilibiliHMT:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/BilibiliHMT.list"}
+  Bilibili:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Bilibili.list"}
+  ChinaMedia:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaMedia.list"}
+  ProxyMedia:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ProxyMedia.list"}
+  ProxyGFWlist:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ProxyGFWlist.list"}
+  ChinaDomain:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaDomain.list"}
+  ChinaCompanyIp:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaCompanyIp.list"}
+  Download:
+    {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Download.list"}
+
+rules:
+  - RULE-SET,LocalAreaNetwork,🎯 全球直连
+  - RULE-SET,UnBan,🎯 全球直连
+  - RULE-SET,BanAD,🛑 广告拦截
+  - RULE-SET,BanProgramAD,🍃 应用净化
+  - RULE-SET,GoogleFCM,📢 谷歌FCM
+  - RULE-SET,GoogleCN,🎯 全球直连
+  - RULE-SET,SteamCN,🎯 全球直连
+  - RULE-SET,Bing,Ⓜ️ 微软Bing
+  - RULE-SET,OneDrive,Ⓜ️ 微软云盘
+  - RULE-SET,Microsoft,Ⓜ️ 微软服务
+  - RULE-SET,Apple,🍎 苹果服务
+  - RULE-SET,Telegram,📲 电报消息
+  - RULE-SET,AI,💬 Ai平台
+  - RULE-SET,OpenAi,💬 Ai平台
+  - RULE-SET,NetEaseMusic,🎶 网易音乐
+  - RULE-SET,Epic,🎮 游戏平台
+  - RULE-SET,Origin,🎮 游戏平台
+  - RULE-SET,Sony,🎮 游戏平台
+  - RULE-SET,Steam,🎮 游戏平台
+  - RULE-SET,Nintendo,🎮 游戏平台
+  - RULE-SET,YouTube,📹 油管视频
+  - RULE-SET,BilibiliHMT,📺 哔哩哔哩
+  - RULE-SET,Bilibili,📺 哔哩哔哩
+  - RULE-SET,ChinaMedia,🌏 国内媒体
+  - RULE-SET,ProxyMedia,🌍 国外媒体
+  - RULE-SET,ProxyGFWlist,🚀 节点选择
+  - RULE-SET,ChinaDomain,🎯 全球直连
+  - RULE-SET,ChinaCompanyIp,🎯 全球直连
+  - RULE-SET,Download,🎯 全球直连
+  - GEOIP,CN,🎯 全球直连
+  - MATCH,🐟 漏网之鱼
