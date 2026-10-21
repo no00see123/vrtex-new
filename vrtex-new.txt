@@ -6,9 +6,9 @@ log-level: info
 proxy-groups:
   - name: "🚀 节点选择"
     type: select
+    include-all: true
+    filter: ".*"
     proxies:
-      - "🇺🇲 美国节点"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "🚀 手动切换"
@@ -16,34 +16,10 @@ proxy-groups:
     include-all: true
     filter: ".*"
 
-  # 已停用：自动测速类分组，固定节点后不再需要
-  # - name: "♻️ 自动选择"
-  #   type: url-test
-  #   include-all: true
-  #   filter: ".*"
-  #   url: "http://www.gstatic.com/generate_204"
-  #   interval: 300
-  #   tolerance: 50
-  #
-  # - name: "🔯 故障转移"
-  #   type: fallback
-  #   include-all: true
-  #   filter: ".*"
-  #   url: "http://www.gstatic.com/generate_204"
-  #   interval: 300
-  #
-  # - name: "🔮 负载均衡"
-  #   type: load-balance
-  #   include-all: true
-  #   filter: ".*"
-  #   url: "http://www.gstatic.com/generate_204"
-  #   interval: 300
-
   - name: "📲 电报消息"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
       - "DIRECT"
 
@@ -53,7 +29,6 @@ proxy-groups:
     filter: "(isp|ISP)"
     proxies:
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
       - "DIRECT"
 
@@ -61,7 +36,6 @@ proxy-groups:
     type: select
     proxies:
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
       - "DIRECT"
 
@@ -69,7 +43,6 @@ proxy-groups:
     type: select
     proxies:
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
       - "DIRECT"
 
@@ -84,7 +57,6 @@ proxy-groups:
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
 
   - name: "Ⓜ️ 微软Bing"
@@ -92,7 +64,6 @@ proxy-groups:
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
 
   - name: "Ⓜ️ 微软云盘"
@@ -100,7 +71,6 @@ proxy-groups:
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
 
   - name: "Ⓜ️ 微软服务"
@@ -108,7 +78,6 @@ proxy-groups:
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
 
   - name: "🍎 苹果服务"
@@ -116,7 +85,6 @@ proxy-groups:
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
 
   - name: "📺 哔哩哔哩"
@@ -130,13 +98,10 @@ proxy-groups:
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
 
   - name: "🎶 网易音乐"
     type: select
-    include-all: true
-    filter: "(网易|音乐|解锁|Music|NetEase)"
     proxies:
       - "DIRECT"
       - "🚀 节点选择"
@@ -164,16 +129,7 @@ proxy-groups:
     proxies:
       - "🚀 节点选择"
       - "DIRECT"
-      - "🇺🇲 美国节点"
       - "🚀 手动切换"
-
-  - name: "🇺🇲 美国节点"
-    type: url-test
-    include-all: true
-    filter: "(美国节点|myself|isp|ISP)"
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 150
 
 rule-providers:
   LocalAreaNetwork:
