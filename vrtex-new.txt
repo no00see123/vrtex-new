@@ -9,6 +9,8 @@ proxy-groups:
     include-all: true
     filter: ".*"
     proxies:
+      - "⚡ 故障转移"
+      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "🚀 手动切换"
@@ -16,19 +18,27 @@ proxy-groups:
     include-all: true
     filter: ".*"
 
+  - name: "⚡ 故障转移"
+    type: url-test
+    include-all: true
+    filter: ".*"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 150
+
   - name: "📲 电报消息"
     type: select
     proxies:
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
       - "DIRECT"
 
   - name: "💬 Ai平台"
     type: select
-    include-all: true
-    filter: "(isp|ISP)"
     proxies:
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
       - "DIRECT"
 
@@ -36,6 +46,7 @@ proxy-groups:
     type: select
     proxies:
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
       - "DIRECT"
 
@@ -43,74 +54,81 @@ proxy-groups:
     type: select
     proxies:
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
       - "DIRECT"
 
   - name: "🌏 国内媒体"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
+      - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "📢 谷歌FCM"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "Ⓜ️ 微软Bing"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "Ⓜ️ 微软云盘"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "Ⓜ️ 微软服务"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "🍎 苹果服务"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "📺 哔哩哔哩"
     type: select
     proxies:
-      - "🎯 全球直连"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
+      - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "🎮 游戏平台"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
   - name: "🎶 网易音乐"
     type: select
     proxies:
-      - "DIRECT"
       - "🚀 节点选择"
-
-  - name: "🎯 全球直连"
-    type: select
-    proxies:
+      - "⚡ 故障转移"
+      - "🚀 手动切换"
       - "DIRECT"
-      - "🚀 节点选择"
 
   - name: "🛑 广告拦截"
     type: select
@@ -128,8 +146,9 @@ proxy-groups:
     type: select
     proxies:
       - "🚀 节点选择"
-      - "DIRECT"
+      - "⚡ 故障转移"
       - "🚀 手动切换"
+      - "DIRECT"
 
 rule-providers:
   LocalAreaNetwork:
@@ -192,13 +211,13 @@ rule-providers:
     {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Download.list"}
 
 rules:
-  - RULE-SET,LocalAreaNetwork,🎯 全球直连
-  - RULE-SET,UnBan,🎯 全球直连
+  - RULE-SET,LocalAreaNetwork,DIRECT
+  - RULE-SET,UnBan,DIRECT
   - RULE-SET,BanAD,🛑 广告拦截
   - RULE-SET,BanProgramAD,🍃 应用净化
   - RULE-SET,GoogleFCM,📢 谷歌FCM
-  - RULE-SET,GoogleCN,🎯 全球直连
-  - RULE-SET,SteamCN,🎯 全球直连
+  - RULE-SET,GoogleCN,DIRECT
+  - RULE-SET,SteamCN,DIRECT
   - RULE-SET,Bing,Ⓜ️ 微软Bing
   - RULE-SET,OneDrive,Ⓜ️ 微软云盘
   - RULE-SET,Microsoft,Ⓜ️ 微软服务
@@ -218,8 +237,8 @@ rules:
   - RULE-SET,ChinaMedia,🌏 国内媒体
   - RULE-SET,ProxyMedia,🌍 国外媒体
   - RULE-SET,ProxyGFWlist,🚀 节点选择
-  - RULE-SET,ChinaDomain,🎯 全球直连
-  - RULE-SET,ChinaCompanyIp,🎯 全球直连
-  - RULE-SET,Download,🎯 全球直连
-  - GEOIP,CN,🎯 全球直连
+  - RULE-SET,ChinaDomain,DIRECT
+  - RULE-SET,ChinaCompanyIp,DIRECT
+  - RULE-SET,Download,DIRECT
+  - GEOIP,CN,DIRECT
   - MATCH,🐟 漏网之鱼
