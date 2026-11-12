@@ -2,15 +2,25 @@ mixed-port: 7890
 allow-lan: true
 mode: rule
 log-level: info
+find-process-mode: always
+profile:
+  store-selected: true
 
 proxy-groups:
+  # 手动选择真实节点；不引用普通组，避免间接选择 DIRECT。
+  # 将来增加可用节点，在这里明确添加其名称，不启用 include-all。
+  - name: "Claude专用"
+    type: select
+    proxies:
+      - "美国节点1-myself"
+      - "REJECT"
+
   - name: "🚀 节点选择"
     type: select
     include-all: true
     filter: ".*"
     proxies:
       - "⚡ 故障转移"
-      - "DIRECT"
 
   - name: "🚀 手动切换"
     type: select
@@ -18,7 +28,6 @@ proxy-groups:
     filter: ".*"
     proxies:
       - "⚡ 故障转移"
-      - "DIRECT"
 
   - name: "⚡ 故障转移"
     type: url-test
@@ -28,15 +37,14 @@ proxy-groups:
     interval: 300
     tolerance: 150
 
-  - name: "📲 电报消息"
+  - name: "💬 Ai平台"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
       - "🚀 手动切换"
-      - "DIRECT"
+      - "REJECT"
 
-  - name: "💬 Ai平台"
+  - name: "📲 电报消息"
     type: select
     proxies:
       - "🚀 节点选择"
@@ -152,6 +160,7 @@ proxy-groups:
       - "🚀 手动切换"
       - "DIRECT"
 
+
 rule-providers:
   LocalAreaNetwork:
     {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/LocalAreaNetwork.list"}
@@ -213,7 +222,18 @@ rule-providers:
     {type: http, behavior: classical, format: text, interval: 86400, url: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Download.list"}
 
 rules:
+  # 沿用原局域网规则集，不写死 NAS 地址或端口。
   - RULE-SET,LocalAreaNetwork,DIRECT
+  # 当前 Windows MSIX 包族内所有 EXE；涵盖主程序和包内辅助程序。
+  # 局域网先直连，其余已识别的 Claude 请求优先进入专用组。
+  - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,Claude专用'
+  - PROCESS-NAME,claude.exe,Claude专用
+  # 补充域名识别；浏览器访问这些域名也会进入 Claude 专用组。
+  # 不是完整域名清单，也不替换下方原有 AI / OpenAi 规则集。
+  - DOMAIN-SUFFIX,claude.ai,Claude专用
+  - DOMAIN-SUFFIX,anthropic.com,Claude专用
+  - DOMAIN-SUFFIX,claudeusercontent.com,Claude专用
+
   - RULE-SET,UnBan,DIRECT
   - RULE-SET,BanAD,🛑 广告拦截
   - RULE-SET,BanProgramAD,🍃 应用净化
