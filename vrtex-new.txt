@@ -9,6 +9,8 @@ dns:
   nameserver:
     - https://1.1.1.1/dns-query
     - https://8.8.8.8/dns-query
+  nameserver-policy:
+    "geosite:cn": 223.5.5.5
   fallback:
     - 1.1.1.1
 find-process-mode: always
@@ -385,6 +387,17 @@ rules:
   - RULE-SET,GoogleCN,DIRECT
   - RULE-SET,SteamCN,DIRECT
   - RULE-SET,ByteDance,DIRECT
+
+  - DOMAIN-KEYWORD,douyin,DIRECT
+  - DOMAIN-SUFFIX,douyincdn.com,DIRECT
+  - DOMAIN-SUFFIX,douyinpic.com,DIRECT
+  - DOMAIN-SUFFIX,douyinvod.com,DIRECT
+  - DOMAIN-SUFFIX,snssdk.com,DIRECT
+  - DOMAIN-SUFFIX,amemv.com,DIRECT
+  - DOMAIN-SUFFIX,pstatp.com,DIRECT
+  - DOMAIN-SUFFIX,byteimg.com,DIRECT
+  - DOMAIN-SUFFIX,volces.com,DIRECT
+
   - DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
   - DOMAIN-SUFFIX,xhscdn.com,DIRECT
   - RULE-SET,Wechat,DIRECT
