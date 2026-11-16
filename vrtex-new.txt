@@ -2,154 +2,161 @@ mixed-port: 7890
 allow-lan: true
 mode: rule
 log-level: info
-dns:
-  enable: true
-  ipv6: false
-  enhanced-mode: fake-ip
-  nameserver:
-    - https://1.1.1.1/dns-query
-    - https://8.8.8.8/dns-query
-  nameserver-policy:
-    "geosite:cn": 223.5.5.5
-  fallback:
-    - 1.1.1.1
+ipv6: false
 find-process-mode: always
 profile:
   store-selected: true
 
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  # 局域网、系统联网检测、NTP 不用假 IP，避免“显示无网络”、时间不同步
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.localdomain"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "time.*.com"
+    - "ntp.*.com"
+    - "+.pool.ntp.org"
+  # 国外 DNS 查询也按规则走代理，DoH 服务器看不到你的家宽 IP
+  respect-rules: true
+  # 只用来解析代理节点本身的域名，必须直连
+  proxy-server-nameserver:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  nameserver-policy:
+    "geosite:cn,private": 223.5.5.5
+  # 改成加密，原来的明文 1.1.1.1 会让运营商看到你查了哪些域名
+  fallback:
+    - https://1.0.0.1/dns-query
+    - https://8.8.4.4/dns-query
+
 proxy-groups:
-  # 手动选择真实节点；不引用普通组，避免间接选择 DIRECT。
-  # 将来增加可用节点，在这里明确添加其名称，不启用 include-all。
+  # AI 组都走手动切换，节点挂了宁可断，不放 DIRECT。
   - name: "Claude专用"
     type: select
     proxies:
-      - "美国节点1-myself"
+      - "🚀 手动切换"
       - "REJECT"
 
+  - name: "🤖 ChatGPT"
+    type: select
+    proxies:
+      - "🚀 手动切换"
+      - "REJECT"
+
+  - name: "✖️ Grok"
+    type: select
+    proxies:
+      - "🚀 手动切换"
+      - "REJECT"
+
+  - name: "♊ Gemini"
+    type: select
+    proxies:
+      - "🚀 手动切换"
+      - "REJECT"
+
+  # 普通代理：排除 myself 节点，避免普通流量弄脏 AI 节点的 IP。
   - name: "🚀 节点选择"
     type: select
     include-all: true
-    filter: ".*"
-    proxies:
-      - "⚡ 故障转移"
 
+  # AI 专用：列出全部真实节点，手动选干净的那个，不含 DIRECT。
   - name: "🚀 手动切换"
     type: select
     include-all: true
-    filter: ".*"
-    proxies:
 
-
-  - name: "⚡ 故障转移"
-    type: url-test
-    include-all: true
-    filter: ".*"
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 150
-
-  - name: "💬 Ai平台"
+  - name: "🧱 DNS防泄露"
     type: select
     proxies:
-      - "🚀 节点选择"
-      - "🚀 手动切换"
       - "REJECT"
+      - "DIRECT"
+
+  - name: "🛡️ WebRTC防泄露"
+    type: select
+    proxies:
+      - "REJECT"
+      - "DIRECT"
 
   - name: "📲 电报消息"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "📹 油管视频"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "🌍 国外媒体"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
-      - "DIRECT"
-
-  - name: "🌏 国内媒体"
-    type: select
-    proxies:
-      - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "📢 谷歌FCM"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "Ⓜ️ 微软Bing"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "Ⓜ️ 微软云盘"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "Ⓜ️ 微软服务"
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
 
   - name: "🍎 苹果服务"
     type: select
     proxies:
-      - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
+      - "🚀 节点选择"
+
+  - name: "🌏 国内媒体"
+    type: select
+    proxies:
+      - "DIRECT"
+      - "🚀 节点选择"
 
   - name: "📺 哔哩哔哩"
     type: select
     proxies:
-      - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
+      - "🚀 节点选择"
 
   - name: "🎮 游戏平台"
     type: select
     proxies:
-      - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
+      - "🚀 节点选择"
 
   - name: "🎶 网易音乐"
     type: select
     proxies:
-      - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
       - "DIRECT"
+      - "🚀 节点选择"
 
   - name: "🛑 广告拦截"
     type: select
@@ -167,11 +174,32 @@ proxy-groups:
     type: select
     proxies:
       - "🚀 节点选择"
-      - "⚡ 故障转移"
-      - "🚀 手动切换"
-      - "DIRECT"
 
 rule-providers:
+  BlockHttpDNS:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/BlockHttpDNS/BlockHttpDNS.list
+  Claude:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Claude/Claude.list
+  OpenAI:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/OpenAI/OpenAI.list
+  Gemini:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Gemini/Gemini.list
   LocalAreaNetwork:
     behavior: classical
     format: text
@@ -244,18 +272,6 @@ rule-providers:
     interval: 86400
     type: http
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Telegram.list
-  AI:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/AI.list
-  OpenAi:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/OpenAi.list
   NetEaseMusic:
     behavior: classical
     format: text
@@ -374,12 +390,64 @@ rule-providers:
 rules:
   - RULE-SET,LocalAreaNetwork,DIRECT
   - PROCESS-NAME,termius.exe,DIRECT
-  - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,Claude专用'
+
+  # WebRTC 防真实 IP：国内通话放行，境外 STUN 拦截
+  - AND,((NETWORK,UDP),(DST-PORT,3478),(GEOIP,CN)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,5349),(GEOIP,CN)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,19302-19309),(GEOIP,CN)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,3478)),🛡️ WebRTC防泄露
+  - AND,((NETWORK,UDP),(DST-PORT,5349)),🛡️ WebRTC防泄露
+  - AND,((NETWORK,UDP),(DST-PORT,19302-19309)),🛡️ WebRTC防泄露
+  - RULE-SET,BlockHttpDNS,🧱 DNS防泄露
+
+  # Claude
+  # ===== AI 客户端进程强制进组（桌面版 + CLI）=====
   - PROCESS-NAME,claude.exe,Claude专用
+  - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,Claude专用'
+
+  # ChatGPT / OpenAI 系
+  - PROCESS-NAME,ChatGPT.exe,🤖 ChatGPT
+  - PROCESS-NAME,chatgpt.exe,🤖 ChatGPT
+  - PROCESS-NAME,codex.exe,🤖 ChatGPT
+  - PROCESS-NAME,copilot.exe,🤖 ChatGPT
+
+  # Grok
+  - PROCESS-NAME,grok.exe,✖️ Grok
+
+  # Gemini
+  - PROCESS-NAME,Gemini.exe,♊ Gemini
+  - PROCESS-NAME,gemini.exe,♊ Gemini
+  - PROCESS-NAME,gemini-cli.exe,♊ Gemini
+
+  # 多模型 AI 工具（进手动切换，因为它就是给 AI 用的）
+  - PROCESS-NAME,Cursor.exe,🚀 手动切换
+  - PROCESS-NAME,cursor.exe,🚀 手动切换
+  - PROCESS-NAME,Code.exe,🚀 手动切换
+  - PROCESS-NAME,Windsurf.exe,🚀 手动切换
+  - PROCESS-NAME,windsurf.exe,🚀 手动切换
+  - PROCESS-NAME,Antigravity.exe,🚀 手动切换
+  - PROCESS-NAME,antigravity.exe,🚀 手动切换
   - DOMAIN-SUFFIX,claude.ai,Claude专用
   - DOMAIN-SUFFIX,claude.com,Claude专用
   - DOMAIN-SUFFIX,anthropic.com,Claude专用
   - DOMAIN-SUFFIX,claudeusercontent.com,Claude专用
+  - RULE-SET,Claude,Claude专用
+
+  # ChatGPT / Grok / Gemini
+  - RULE-SET,OpenAI,🤖 ChatGPT
+  - DOMAIN-SUFFIX,x.ai,✖️ Grok
+  - DOMAIN-SUFFIX,grok.com,✖️ Grok
+  - DOMAIN-SUFFIX,x.com,✖️ Grok
+  - DOMAIN-SUFFIX,twitter.com,✖️ Grok
+  - DOMAIN-SUFFIX,twimg.com,✖️ Grok
+  - DOMAIN-SUFFIX,t.co,✖️ Grok
+  - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
+  - RULE-SET,Gemini,♊ Gemini
+
+  # 代理流量禁用 QUIC（国内 UDP 443 不受影响）
+  - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
 
   - RULE-SET,UnBan,DIRECT
   - RULE-SET,BanAD,🛑 广告拦截
@@ -401,6 +469,7 @@ rules:
 
   - DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
   - DOMAIN-SUFFIX,xhscdn.com,DIRECT
+  - DOMAIN-SUFFIX,goofish.com,DIRECT
   - RULE-SET,Wechat,DIRECT
   - RULE-SET,Kuaishou,DIRECT
   - RULE-SET,Alibaba,DIRECT
@@ -411,8 +480,6 @@ rules:
   - RULE-SET,Microsoft,Ⓜ️ 微软服务
   - RULE-SET,Apple,🍎 苹果服务
   - RULE-SET,Telegram,📲 电报消息
-  - RULE-SET,AI,💬 Ai平台
-  - RULE-SET,OpenAi,💬 Ai平台
   - RULE-SET,NetEaseMusic,🎶 网易音乐
   - RULE-SET,TencentLolm,🎮 游戏平台
   - RULE-SET,Sony,🎮 游戏平台
