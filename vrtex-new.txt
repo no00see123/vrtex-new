@@ -38,7 +38,7 @@ proxy-groups:
     include-all: true
     filter: ".*"
     proxies:
-      - "⚡ 故障转移"
+
 
   - name: "⚡ 故障转移"
     type: url-test
@@ -373,6 +373,7 @@ rule-providers:
 
 rules:
   - RULE-SET,LocalAreaNetwork,DIRECT
+  - PROCESS-NAME,termius.exe,DIRECT
   - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,Claude专用'
   - PROCESS-NAME,claude.exe,Claude专用
   - DOMAIN-SUFFIX,claude.ai,Claude专用
