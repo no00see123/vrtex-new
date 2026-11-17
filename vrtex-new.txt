@@ -463,15 +463,6 @@ rules:
   - RULE-SET,SteamCN,DIRECT
   - RULE-SET,ByteDance,DIRECT
 
-  - RULE-SET,Riot,DIRECT
-  - PROCESS-NAME,WeGame.exe,DIRECT
-  - PROCESS-NAME,WeGameLauncher.exe,DIRECT
-  - PROCESS-NAME,WeGameHelper.exe,DIRECT
-  - PROCESS-NAME,LeagueClient.exe,DIRECT
-  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
-  - PROCESS-NAME,League of Legends.exe,DIRECT
-  - PROCESS-NAME,RiotClientServices.exe,DIRECT
-
   - DOMAIN-KEYWORD,douyin,DIRECT
   - DOMAIN-SUFFIX,douyincdn.com,DIRECT
   - DOMAIN-SUFFIX,douyinpic.com,DIRECT
@@ -508,5 +499,19 @@ rules:
   - RULE-SET,ChinaDomain,DIRECT
   - RULE-SET,ChinaCompanyIp,DIRECT
   - RULE-SET,Download,DIRECT
+
+  - RULE-SET,Riot,DIRECT
+  - PROCESS-NAME,WeGame.exe,DIRECT
+  - PROCESS-NAME,WeGameLauncher.exe,DIRECT
+  - PROCESS-NAME,WeGameHelper.exe,DIRECT
+  - PROCESS-NAME,LeagueClient.exe,DIRECT
+  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
+  - PROCESS-NAME,League of Legends.exe,DIRECT
+  - PROCESS-NAME,RiotClientServices.exe,DIRECT
+  - DOMAIN-SUFFIX,qorbentaxil.cc,DIRECT
+  - DOMAIN-SUFFIX,fluvenkarthon.info,DIRECT
+  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
+  - PROCESS-NAME,LeagueClientUxRender.exe,DIRECT
+
   - GEOIP,CN,DIRECT
   - MATCH,🐟 漏网之鱼
