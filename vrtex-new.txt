@@ -512,6 +512,7 @@ rules:
   - DOMAIN-SUFFIX,fluvenkarthon.info,DIRECT
   - PROCESS-NAME,LeagueClientUx.exe,DIRECT
   - PROCESS-NAME,LeagueClientUxRender.exe,DIRECT
+  - PROCESS-NAME,browser.exe,DIRECT
 
   - GEOIP,CN,DIRECT
   - MATCH,🐟 漏网之鱼
