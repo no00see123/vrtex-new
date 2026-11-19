@@ -177,17 +177,17 @@ proxy-groups:
 
 rule-providers:
   BlockHttpDNS:
+    type: http
     behavior: classical
     format: text
     interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/BlockHttpDNS/BlockHttpDNS.list
+    url: https://raw.githubusercontent.com/VirgilClyne/GetSomeFries/main/ruleset/HTTPDNS.Block.list
   Claude:
+    type: http
     behavior: classical
     format: text
     interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Claude/Claude.list
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/anthropic.list
   OpenAI:
     behavior: classical
     format: text
@@ -278,18 +278,6 @@ rule-providers:
     interval: 86400
     type: http
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/NetEaseMusic.list
-  TencentLolm:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/TencentLolm.list
-  Riot:
-    type: http
-    behavior: classical
-    url: "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Riot/Riot.list"
-    path: ./ruleset/riot.list
-    interval: 86400
   YouTube:
     behavior: classical
     format: text
@@ -308,42 +296,6 @@ rule-providers:
     interval: 86400
     type: http
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Bilibili.list
-  SteamCN:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/SteamCN.list
-  Steam:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Steam.list
-  Sony:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Sony.list
-  Kuaishou:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Kuaishou.list
-  Alibaba:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Alibaba.list
-  JD:
-    behavior: classical
-    format: text
-    interval: 86400
-    type: http
-    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/JD.list
   Bing:
     behavior: classical
     format: text
@@ -392,6 +344,54 @@ rule-providers:
     interval: 86400
     type: http
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Download.list
+  Kuaishou:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Kuaishou.list
+  Alibaba:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Alibaba.list
+  JD:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/JD.list
+  SteamCN:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/SteamCN.list
+  Steam:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Steam.list
+  TencentLolm:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/TencentLolm.list
+  Riot:
+    type: http
+    behavior: classical
+    url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Riot/Riot.list
+    path: ./ruleset/riot.list
+    interval: 86400
+  Sony:
+    behavior: classical
+    format: text
+    interval: 86400
+    type: http
+    url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Sony.list
 
 rules:
 # WebRTC 防真实 IP：国内通话放行，境外 STUN 拦截
@@ -406,6 +406,7 @@ rules:
   # 代理流量禁用 QUIC（国内 UDP 443 不受影响）
   - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
 
+  - RULE-SET,UnBan,DIRECT
   - RULE-SET,BanAD,🛑 广告拦截
   - RULE-SET,BanProgramAD,🍃 应用净化
 
@@ -452,17 +453,15 @@ rules:
   - PROCESS-NAME,Antigravity.exe,🚀 手动切换
   - PROCESS-NAME,antigravity.exe,🚀 手动切换
 
-  # ChatGPT / Grok / Gemini
-
   - RULE-SET,LocalAreaNetwork,DIRECT
   - PROCESS-NAME,termius.exe,DIRECT
 
-  - RULE-SET,UnBan,DIRECT
   - RULE-SET,GoogleFCM,📢 谷歌FCM
   - RULE-SET,GoogleCN,DIRECT
   - RULE-SET,SteamCN,DIRECT
   - RULE-SET,ByteDance,DIRECT
 
+  - RULE-SET,Wechat,DIRECT
   - DOMAIN-KEYWORD,douyin,DIRECT
   - DOMAIN-SUFFIX,douyincdn.com,DIRECT
   - DOMAIN-SUFFIX,douyinpic.com,DIRECT
@@ -476,7 +475,22 @@ rules:
   - DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
   - DOMAIN-SUFFIX,xhscdn.com,DIRECT
   - DOMAIN-SUFFIX,goofish.com,DIRECT
-  - RULE-SET,Wechat,DIRECT
+
+  - RULE-SET,Riot,DIRECT
+  - PROCESS-NAME,WeGame.exe,DIRECT
+  - PROCESS-NAME,WeGameLauncher.exe,DIRECT
+  - PROCESS-NAME,WeGameHelper.exe,DIRECT
+  - PROCESS-NAME,LeagueClient.exe,DIRECT
+  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
+  - PROCESS-NAME,League of Legends.exe,DIRECT
+  - PROCESS-NAME,RiotClientServices.exe,DIRECT
+  - DOMAIN-SUFFIX,qorbentaxil.cc,DIRECT
+  - DOMAIN-SUFFIX,fluvenkarthon.info,DIRECT
+  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
+  - PROCESS-NAME,LeagueClientUxRender.exe,DIRECT
+  - PROCESS-NAME,browser.exe,DIRECT
+
+
   - RULE-SET,Kuaishou,DIRECT
   - RULE-SET,Alibaba,DIRECT
   - RULE-SET,Tencent,DIRECT
@@ -499,20 +513,6 @@ rules:
   - RULE-SET,ChinaDomain,DIRECT
   - RULE-SET,ChinaCompanyIp,DIRECT
   - RULE-SET,Download,DIRECT
-
-  - RULE-SET,Riot,DIRECT
-  - PROCESS-NAME,WeGame.exe,DIRECT
-  - PROCESS-NAME,WeGameLauncher.exe,DIRECT
-  - PROCESS-NAME,WeGameHelper.exe,DIRECT
-  - PROCESS-NAME,LeagueClient.exe,DIRECT
-  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
-  - PROCESS-NAME,League of Legends.exe,DIRECT
-  - PROCESS-NAME,RiotClientServices.exe,DIRECT
-  - DOMAIN-SUFFIX,qorbentaxil.cc,DIRECT
-  - DOMAIN-SUFFIX,fluvenkarthon.info,DIRECT
-  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
-  - PROCESS-NAME,LeagueClientUxRender.exe,DIRECT
-  - PROCESS-NAME,browser.exe,DIRECT
 
   - GEOIP,CN,DIRECT
   - MATCH,🐟 漏网之鱼
