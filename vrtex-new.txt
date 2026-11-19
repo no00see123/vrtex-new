@@ -40,7 +40,7 @@ dns:
 
 proxy-groups:
   # AI 组都走手动切换，节点挂了宁可断，不放 DIRECT。
-  - name: "Claude专用"
+  - name: "✴️Claude"
     type: select
     proxies:
       - "🚀 手动切换"
@@ -394,10 +394,7 @@ rule-providers:
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Download.list
 
 rules:
-  - RULE-SET,LocalAreaNetwork,DIRECT
-  - PROCESS-NAME,termius.exe,DIRECT
-
-  # WebRTC 防真实 IP：国内通话放行，境外 STUN 拦截
+# WebRTC 防真实 IP：国内通话放行，境外 STUN 拦截
   - AND,((NETWORK,UDP),(DST-PORT,3478),(GEOIP,CN)),DIRECT
   - AND,((NETWORK,UDP),(DST-PORT,5349),(GEOIP,CN)),DIRECT
   - AND,((NETWORK,UDP),(DST-PORT,19302-19309),(GEOIP,CN)),DIRECT
@@ -406,24 +403,45 @@ rules:
   - AND,((NETWORK,UDP),(DST-PORT,19302-19309)),🛡️ WebRTC防泄露
   - RULE-SET,BlockHttpDNS,🧱 DNS防泄露
 
+  # 代理流量禁用 QUIC（国内 UDP 443 不受影响）
+  - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
+
+  - RULE-SET,BanAD,🛑 广告拦截
+  - RULE-SET,BanProgramAD,🍃 应用净化
+
   # Claude
+  - DOMAIN-SUFFIX,claude.ai,✴️Claude
+  - DOMAIN-SUFFIX,claude.com,✴️Claude
+  - DOMAIN-SUFFIX,anthropic.com,✴️Claude
+  - DOMAIN-SUFFIX,claudeusercontent.com,✴️Claude
+  - RULE-SET,Claude,✴️Claude
   # ===== AI 客户端进程强制进组（桌面版 + CLI）=====
-  - PROCESS-NAME,claude.exe,Claude专用
-  - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,Claude专用'
+  - PROCESS-NAME,claude.exe,✴️Claude
+  - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,✴️Claude'
 
   # ChatGPT / OpenAI 系
   - PROCESS-NAME,ChatGPT.exe,🤖 ChatGPT
   - PROCESS-NAME,chatgpt.exe,🤖 ChatGPT
   - PROCESS-NAME,codex.exe,🤖 ChatGPT
   - PROCESS-NAME,copilot.exe,🤖 ChatGPT
+  - RULE-SET,OpenAI,🤖 ChatGPT
 
   # Grok
   - PROCESS-NAME,grok.exe,✖️ Grok
+  - DOMAIN-SUFFIX,x.ai,✖️ Grok
+  - DOMAIN-SUFFIX,grok.com,✖️ Grok
+  - DOMAIN-SUFFIX,twitter.com,✖️ Grok
+  - DOMAIN-SUFFIX,twimg.com,✖️ Grok
+  - DOMAIN-SUFFIX,t.co,✖️ Grok
 
   # Gemini
   - PROCESS-NAME,Gemini.exe,♊ Gemini
   - PROCESS-NAME,gemini.exe,♊ Gemini
   - PROCESS-NAME,gemini-cli.exe,♊ Gemini
+  - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
+  - RULE-SET,Gemini,♊ Gemini
 
   # 多模型 AI 工具（进手动切换，因为它就是给 AI 用的）
   - PROCESS-NAME,Cursor.exe,🚀 手动切换
@@ -433,31 +451,13 @@ rules:
   - PROCESS-NAME,windsurf.exe,🚀 手动切换
   - PROCESS-NAME,Antigravity.exe,🚀 手动切换
   - PROCESS-NAME,antigravity.exe,🚀 手动切换
-  - DOMAIN-SUFFIX,claude.ai,Claude专用
-  - DOMAIN-SUFFIX,claude.com,Claude专用
-  - DOMAIN-SUFFIX,anthropic.com,Claude专用
-  - DOMAIN-SUFFIX,claudeusercontent.com,Claude专用
-  - RULE-SET,Claude,Claude专用
 
   # ChatGPT / Grok / Gemini
-  - RULE-SET,OpenAI,🤖 ChatGPT
-  - DOMAIN-SUFFIX,x.ai,✖️ Grok
-  - DOMAIN-SUFFIX,grok.com,✖️ Grok
-  - DOMAIN-SUFFIX,x.com,✖️ Grok
-  - DOMAIN-SUFFIX,twitter.com,✖️ Grok
-  - DOMAIN-SUFFIX,twimg.com,✖️ Grok
-  - DOMAIN-SUFFIX,t.co,✖️ Grok
-  - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
-  - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
-  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
-  - RULE-SET,Gemini,♊ Gemini
 
-  # 代理流量禁用 QUIC（国内 UDP 443 不受影响）
-  - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
+  - RULE-SET,LocalAreaNetwork,DIRECT
+  - PROCESS-NAME,termius.exe,DIRECT
 
   - RULE-SET,UnBan,DIRECT
-  - RULE-SET,BanAD,🛑 广告拦截
-  - RULE-SET,BanProgramAD,🍃 应用净化
   - RULE-SET,GoogleFCM,📢 谷歌FCM
   - RULE-SET,GoogleCN,DIRECT
   - RULE-SET,SteamCN,DIRECT
