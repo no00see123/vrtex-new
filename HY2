@@ -19,7 +19,7 @@ readonly PINNED_SHA256_LINUX_ARM64='e7c52241299fe85aba11e9d36e85d8d88ddbb5799ac0
 readonly HASHES_FILE_NAME='hashes.txt'
 
 readonly SCRIPT_NAME='install-hy2-node.sh'
-readonly SCRIPT_VERSION='1.1.0'
+readonly SCRIPT_VERSION='1.1.1'
 readonly UNIT_NAME='hy2-node.service'
 readonly DEFAULT_PREFIX='/opt/hy2-node'
 readonly SYSUSER='hy2-node'
@@ -1228,6 +1228,10 @@ rollback_install() {
       rm -f "$SYSCTL_FILE"
     fi
   fi
+  # 首次安装失败后配置/密码仍保留；把目录权限修成可重跑，避免残留 1.1.0 那种组不可写 ACME 目录
+  if [[ -d "$PREFIX" ]]; then
+    fix_permissions || true
+  fi
 }
 
 ensure_sysuser() {
@@ -1274,17 +1278,39 @@ EOF
   systemctl daemon-reload
 }
 
+# 目录权限策略（最小可运行，不为方便而 0777，服务不以 root 跑）：
+#   PREFIX、BIN_DIR        root:root 0755，供遍历和执行
+#   ETC_DIR                root:hy2-node 0750；config/state 0640，服务只读
+#   客户端 URI / Mihomo    root:root 0600，服务无需读取
+#   VAR_DIR                root:hy2-node 0750，供服务用户进入
+#   ACME_DIR               hy2-node:hy2-node 0700，CertMagic 必须能在此创建临时文件和证书
+#   LOG_DIR                hy2-node:hy2-node 0750
+# 旧版 1.1.0 把 ACME 设成 root:hy2-node 0750（组无写权限），服务用户无法创建
+# /opt/hy2-node/var/acme/<临时文件>，官方程序会报 storage is probably misconfigured。
 fix_permissions() {
   mkdir -p "$BIN_DIR" "$ETC_DIR" "$VAR_DIR" "$LOG_DIR" "$ACME_DIR"
-  chmod 0755 "$PREFIX" "$BIN_DIR" "$VAR_DIR"
-  chmod 0750 "$ETC_DIR" "$LOG_DIR" "$ACME_DIR"
+  chmod 0755 "$PREFIX" "$BIN_DIR"
+  chmod 0750 "$ETC_DIR" "$VAR_DIR"
+  chmod 0750 "$LOG_DIR"
+  chmod 0700 "$ACME_DIR"
   if id -u "$SYSUSER" >/dev/null 2>&1; then
-    chown -R root:"$SYSUSER" "$ETC_DIR" "$LOG_DIR" "$ACME_DIR" "$VAR_DIR"
+    chown root:root "$PREFIX" "$BIN_DIR" 2>/dev/null || true
+    chown root:"$SYSUSER" "$ETC_DIR" "$VAR_DIR"
+    # ACME / LOG 必须由服务用户写入；不要先 chown -R root:group 再忘了改回来
+    chown -R "$SYSUSER":"$SYSUSER" "$ACME_DIR" "$LOG_DIR"
     chown root:root "$BIN_DIR/hysteria" 2>/dev/null || true
     chmod 0755 "$BIN_DIR/hysteria" 2>/dev/null || true
   fi
+  chmod 0755 "$PREFIX" "$BIN_DIR"
+  chmod 0750 "$ETC_DIR" "$VAR_DIR"
+  chmod 0750 "$LOG_DIR"
+  chmod 0700 "$ACME_DIR"
   [[ -e "$CONFIG_FILE" ]] && chmod 0640 "$CONFIG_FILE"
   [[ -e "$STATE_FILE" ]] && chmod 0640 "$STATE_FILE"
+  if id -u "$SYSUSER" >/dev/null 2>&1; then
+    [[ -e "$CONFIG_FILE" ]] && chown root:"$SYSUSER" "$CONFIG_FILE"
+    [[ -e "$STATE_FILE" ]] && chown root:"$SYSUSER" "$STATE_FILE"
+  fi
   if [[ -e "$LINK_FILE" ]]; then
     chmod 0600 "$LINK_FILE"
     chown root:root "$LINK_FILE" 2>/dev/null || true
@@ -1292,6 +1318,164 @@ fix_permissions() {
   if [[ -e "$MIHOMO_FILE" ]]; then
     chmod 0600 "$MIHOMO_FILE"
     chown root:root "$MIHOMO_FILE" 2>/dev/null || true
+  fi
+}
+
+# 纯权限模型：判断指定 uid/gid 对某文件的读/写/进入是否被 Unix 权限允许。
+unix_perm_allows() {
+  python3 - "$@" <<'PYCODE'
+import os,stat,sys
+path, uid, gid, op = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+try:
+    st=os.stat(path)
+except OSError:
+    sys.exit(2)
+mode=st.st_mode
+if uid == st.st_uid:
+    bits = {"read": stat.S_IRUSR, "write": stat.S_IWUSR, "exec": stat.S_IXUSR}[op]
+elif gid == st.st_gid:
+    bits = {"read": stat.S_IRGRP, "write": stat.S_IWGRP, "exec": stat.S_IXGRP}[op]
+else:
+    bits = {"read": stat.S_IROTH, "write": stat.S_IWOTH, "exec": stat.S_IXOTH}[op]
+sys.exit(0 if (mode & bits) else 1)
+PYCODE
+}
+
+# 用数字 uid/gid 描述布局是否满足服务用户需求（不依赖当前进程身份）。
+layout_allows_service_user() {
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYCODE'
+import os,stat,sys
+prefix, etc_dir, cfg, var_dir, acme_dir = sys.argv[1:6]
+uid, gid = int(sys.argv[6]), int(sys.argv[7])
+
+def allows(path, op):
+    st=os.stat(path)
+    mode=st.st_mode
+    if uid == st.st_uid:
+        bits={"read":stat.S_IRUSR,"write":stat.S_IWUSR,"exec":stat.S_IXUSR}[op]
+    elif gid == st.st_gid:
+        bits={"read":stat.S_IRGRP,"write":stat.S_IWGRP,"exec":stat.S_IXGRP}[op]
+    else:
+        bits={"read":stat.S_IROTH,"write":stat.S_IWOTH,"exec":stat.S_IXOTH}[op]
+    return bool(mode & bits)
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+for d,name in ((prefix,"安装根目录"),(var_dir,"var 目录")):
+    if not allows(d,"exec"):
+        fail("%s 对服务用户不可进入：%s" % (name,d))
+if not allows(etc_dir,"exec") or not allows(etc_dir,"read"):
+    fail("配置目录对服务用户不可进入或列出：%s" % etc_dir)
+if os.path.exists(cfg) and not allows(cfg,"read"):
+    fail("服务用户读不了配置：%s" % cfg)
+if not allows(acme_dir,"exec") or not allows(acme_dir,"write"):
+    fail("服务用户无法在 ACME 目录创建文件：%s" % acme_dir)
+st=os.stat(acme_dir)
+# 证书私钥所在目录不得对其他人可写/可读
+if st.st_mode & (stat.S_IROTH|stat.S_IWOTH|stat.S_IWGRP):
+    fail("ACME 目录权限过宽：%s mode=%o" % (acme_dir, st.st_mode & 0o777))
+print("layout ok")
+PYCODE
+}
+
+# 安装后检查：服务用户能进入父目录、读配置、写 ACME 缓存。
+assert_runtime_access() {
+  if ! id -u "$SYSUSER" >/dev/null 2>&1; then
+    # 沙箱或尚未创建用户时，至少确认 ACME 目录对属主可写且非世界可读写
+    local mode
+    mode="$(stat -c '%a' "$ACME_DIR" 2>/dev/null || true)"
+    if [[ "$mode" != "700" ]]; then
+      die "ACME 目录权限异常（${ACME_DIR} 为 ${mode:-未知}），应为 700（属主可写，不对其他人开放）。"
+    fi
+    return 0
+  fi
+  local uid gid
+  uid="$(id -u "$SYSUSER")"
+  gid="$(id -g "$SYSUSER")"
+  if ! layout_allows_service_user "$PREFIX" "$ETC_DIR" "$CONFIG_FILE" "$VAR_DIR" "$ACME_DIR" "$uid" "$gid"; then
+    die "目录权限不足以让服务用户读取配置并写入 ACME 缓存，已中止，以免再次出现 storage permission denied。"
+  fi
+  # 若当前是 root，再以服务用户真实试一次写探针（写完即删）
+  if [[ "$(id -u)" == "0" ]]; then
+    local probe rc
+    probe="${ACME_DIR}/.hy2-write-probe.$$"
+    set +e
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$SYSUSER" -- sh -c "test -r '$CONFIG_FILE' && test -x '$PREFIX' && test -x '$VAR_DIR' && touch '$probe'"
+      rc=$?
+    else
+      su -s /bin/sh "$SYSUSER" -c "test -r '$CONFIG_FILE' && test -x '$PREFIX' && test -x '$VAR_DIR' && touch '$probe'"
+      rc=$?
+    fi
+    set -e
+    rm -f "$probe"
+    if [[ $rc -ne 0 ]]; then
+      die "以服务用户 ${SYSUSER} 实测：无法读取配置或在 ${ACME_DIR} 创建文件。已中止。"
+    fi
+    info "已确认服务用户 ${SYSUSER} 可读取配置并写入 ACME 目录。"
+  fi
+}
+
+# 用权限数字+属主模拟（不依赖真实 uid 切换）判断旧/新布局。
+simulate_layout_access() {
+  python3 - <<'PYCODE'
+import stat,sys
+
+def allows(owner, group, mode, uid, gid, op):
+    if uid == owner:
+        bits={"read":stat.S_IRUSR,"write":stat.S_IWUSR,"exec":stat.S_IXUSR}[op]
+    elif gid == group:
+        bits={"read":stat.S_IRGRP,"write":stat.S_IWGRP,"exec":stat.S_IXGRP}[op]
+    else:
+        bits={"read":stat.S_IROTH,"write":stat.S_IWOTH,"exec":stat.S_IXOTH}[op]
+    return bool(mode & bits)
+
+# 旧 1.1.0：ACME root:hy2-node 0750
+uid=gid=1001
+old_ok = allows(0, 1001, 0o750, uid, gid, "write")
+# 新 1.1.1：ACME hy2-node:hy2-node 0700
+new_ok = allows(1001, 1001, 0o700, uid, gid, "write")
+# 配置 root:hy2-node 0640 应可读不可写
+cfg_r = allows(0, 1001, 0o640, uid, gid, "read")
+cfg_w = allows(0, 1001, 0o640, uid, gid, "write")
+# 父目录 0755 / var 0750 root:hy2-node 应可进入
+pref_x = allows(0, 0, 0o755, uid, gid, "exec")
+var_x = allows(0, 1001, 0o750, uid, gid, "exec")
+if old_ok:
+    print("旧 0750 root:group 布局按模型应无法写入，但计算结果可写", file=sys.stderr)
+    sys.exit(1)
+if not new_ok or not cfg_r or cfg_w or not pref_x or not var_x:
+    print("新布局模型未通过：write_acme=%s read_cfg=%s write_cfg=%s prefix_x=%s var_x=%s" % (new_ok,cfg_r,cfg_w,pref_x,var_x), file=sys.stderr)
+    sys.exit(1)
+print("perm model ok")
+PYCODE
+}
+
+classify_service_log() {
+  # 只根据“当前这次启动”的日志判断。成功优先于失败，避免把同单元旧 FATAL 当成本次失败。
+  python3 - "$1" <<'PYCODE'
+import sys,re
+text=sys.argv[1] if len(sys.argv)>1 else sys.stdin.read()
+if re.search(r"server up and running", text, re.I):
+    print("ready")
+    sys.exit(0)
+if re.search(r"FATAL|failed to load server config|authorization failed|rateLimited|storage is probably misconfigured", text, re.I):
+    print("failed")
+    sys.exit(2)
+print("pending")
+PYCODE
+}
+
+collect_current_service_logs() {
+  local inv="${1:-}" since="${2:-}"
+  if [[ -n "$inv" ]]; then
+    journalctl -u "$UNIT_NAME" INVOCATION_ID="$inv" --no-pager -o short-iso 2>/dev/null || true
+  elif [[ -n "$since" ]]; then
+    journalctl -u "$UNIT_NAME" --since "$since" --no-pager -o short-iso 2>/dev/null || true
+  else
+    journalctl -u "$UNIT_NAME" -n 30 --no-pager -o short-iso 2>/dev/null || true
   fi
 }
 
@@ -1306,44 +1490,53 @@ install_binary() {
 }
 
 wait_service_ready() {
-  local logtxt
-  for _ in $(seq 1 90); do
-    logtxt="$(journalctl -u "$UNIT_NAME" -n 80 --no-pager 2>/dev/null || true)"
-    if printf '%s\n' "$logtxt" | grep -qiE 'server up and running'; then
-      return 0
+  local logtxt state inv since
+  since="${SERVICE_WAIT_SINCE:-}"
+  # 只看本次 invocation，避免把上次失败残留的 FATAL 当成这一次失败
+  inv="$(systemctl show -p InvocationID --value "$UNIT_NAME" 2>/dev/null || true)"
+  for _ in $(seq 1 120); do
+    if [[ -z "$inv" ]]; then
+      inv="$(systemctl show -p InvocationID --value "$UNIT_NAME" 2>/dev/null || true)"
     fi
-    if printf '%s\n' "$logtxt" | grep -qiE 'FATAL|failed to load server config|obtaining certificate|authorization failed|rateLimited'; then
-      err "服务日志出现失败信息："
-      printf '%s\n' "$logtxt" | tail -n 40 >&2
-      return 1
-    fi
+    logtxt="$(collect_current_service_logs "$inv" "$since")"
+    state="$(classify_service_log "$logtxt" || true)"
+    case "$state" in
+      ready) return 0 ;;
+      failed)
+        err "本次启动的服务日志出现失败信息："
+        printf '%s\n' "$logtxt" | tail -n 40 >&2
+        return 1
+        ;;
+    esac
     if ! systemctl is-active --quiet "$UNIT_NAME"; then
       err "服务未保持运行。"
       systemctl status "$UNIT_NAME" --no-pager -l || true
+      printf '%s\n' "$logtxt" | tail -n 40 >&2 || true
       return 1
     fi
     sleep 1
   done
   if systemctl is-active --quiet "$UNIT_NAME"; then
-    warn "90 秒内未在日志中看到 server up and running，但服务仍在运行。请自行检查：journalctl -u ${UNIT_NAME} -e"
+    warn "120 秒内未在本次启动日志中看到 server up and running，但服务仍在运行。请自行检查：journalctl -u ${UNIT_NAME} -e"
     return 0
   fi
   return 1
 }
 
 start_service() {
+  SERVICE_WAIT_SINCE="$(date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%d %H:%M:%S %z')"
   systemctl enable "$UNIT_NAME"
   if ! systemctl restart "$UNIT_NAME"; then
     err "服务启动失败。"
     systemctl status "$UNIT_NAME" --no-pager -l || true
-    journalctl -u "$UNIT_NAME" -n 80 --no-pager || true
+    collect_current_service_logs "$(systemctl show -p InvocationID --value "$UNIT_NAME" 2>/dev/null || true)" "$SERVICE_WAIT_SINCE" | tail -n 80 >&2 || true
     rollback_install
-    die "已回滚到安装前状态（若为首次安装则已禁用并移除新单元）。"
+    die "已回滚到安装前状态（若为首次安装则已禁用并移除新单元）。配置和密码会保留，修正后可直接再运行本脚本。"
   fi
   SERVICE_STARTED_THIS_RUN=1
   if ! wait_service_ready; then
     rollback_install
-    die "服务未能就绪，已回滚。"
+    die "服务未能就绪，已回滚。配置和密码会保留，修正后可直接再运行本脚本。"
   fi
   info "服务 ${UNIT_NAME} 已运行。官方内置 ACME（CertMagic）会在服务运行期间自动续期并继续使用新证书，无需另装定时任务。"
 }
@@ -1536,11 +1729,13 @@ run_change_port() {
   write_client_files
   save_state
   if [[ $SANDBOX -eq 1 ]]; then
+    fix_permissions
     info "沙箱模式：已写入新端口的配置与客户端文件，未重启系统服务，也未改防火墙。"
     return 0
   fi
-  restart_our_service_after_port_change
   fix_permissions
+  assert_runtime_access
+  restart_our_service_after_port_change
   maybe_open_new_udp_port
   info "换端口完成：${OLD_PORT}/udp -> ${PORT}/udp。显示名：${NODE_NAME}；证书与 SNI 仍是 ${SNI}。"
   info "更新后的客户端 URI：${LINK_FILE}；Mihomo 片段：${MIHOMO_FILE}"
@@ -1721,6 +1916,7 @@ run_install() {
   write_client_files
   write_unit
   fix_permissions
+  assert_runtime_access
   maybe_apply_udp_buffers
   maybe_open_ports
   start_service
@@ -1985,6 +2181,158 @@ PYCODE
   local cfyes
   cfyes="$(cf_reason_if_any '104.16.1.1')"
   [[ "$cfyes" == "yes" ]] || { err "Cloudflare 地址段识别失败"; rc=1; }
+
+  info "测试 ACME 目录权限模型（1.1.0 组不可写会失败，1.1.1 布局可通过）…"
+  if ! simulate_layout_access; then
+    err "权限模型自检失败"
+    rc=1
+  else
+    info "权限模型通过"
+  fi
+
+  info "测试真实目录上的服务用户权限判断（不创建系统用户、不改共享机账户）…"
+  local permroot svc_uid svc_gid
+  permroot="${testdir}/perm-layout"
+  rm -rf "$permroot"
+  mkdir -p "$permroot/etc" "$permroot/var/acme" "$permroot/log" "$permroot/bin"
+  printf 'listen: :443\n' >"$permroot/etc/config.yaml"
+  chmod 0755 "$permroot"
+  chmod 0750 "$permroot/etc" "$permroot/var"
+  chmod 0640 "$permroot/etc/config.yaml"
+  svc_uid="$(id -u)"
+  svc_gid="$(id -g)"
+  # 复现 1.1.0：ACME 0750，检查者不是属主，只匹配组，组无写权限
+  chmod 0750 "$permroot/var/acme"
+  if layout_allows_service_user "$permroot" "$permroot/etc" "$permroot/etc/config.yaml" "$permroot/var" "$permroot/var/acme" "999999" "$svc_gid"; then
+    err "0750 组不可写的 ACME 目录不应判定为可写"
+    rc=1
+  else
+    info "已复现 1.1.0 式 ACME 权限会被拒绝"
+  fi
+  if unix_perm_allows "$permroot/var/acme" "999999" "$svc_gid" write; then
+    err "unix_perm_allows 未拒绝组不可写的 0750 ACME 目录"
+    rc=1
+  fi
+  # 1.1.1：属主即服务用户，0700
+  chmod 0700 "$permroot/var/acme"
+  if layout_allows_service_user "$permroot" "$permroot/etc" "$permroot/etc/config.yaml" "$permroot/var" "$permroot/var/acme" "$svc_uid" "$svc_gid"; then
+    if ! unix_perm_allows "$permroot/var/acme" "$svc_uid" "$svc_gid" write || ! unix_perm_allows "$permroot/etc/config.yaml" "$svc_uid" "$svc_gid" read; then
+      err "unix_perm_allows 未确认 0700 ACME 可写或配置可读"
+      rc=1
+    fi
+    touch "$permroot/var/acme/probe-write" && rm -f "$permroot/var/acme/probe-write"
+    info "1.1.1 布局下当前用户可写 ACME 并读配置"
+  else
+    err "1.1.1 布局权限判断失败"
+    rc=1
+  fi
+  # shellcheck disable=SC2016  # 有意匹配源码中的变量字面量，不是要展开
+  if grep -q 'ReadWritePaths=${LOG_DIR} ${ACME_DIR} ${VAR_DIR}' "$0" && grep -q 'ProtectSystem=strict' "$0"; then
+    info "单元文件仍包含 ProtectSystem=strict，以及 ACME/var/log 的 ReadWritePaths"
+  else
+    err "单元模板缺少必要的 systemd 路径保护或可写路径"
+    rc=1
+  fi
+  info "未能在无 root 的共享机上启动带 ProtectSystem=strict 的真实 unit，也未创建 hy2-node 系统用户；Unix 权限模型与目录实测已覆盖，systemd 只读根目录效果需在目标 VPS 上验证。"
+
+  info "测试本次启动日志分类（旧 FATAL 不应压过本次成功）…"
+  if [[ "$(classify_service_log '2026-11-22 INFO server up and running')" != "ready" ]]; then
+    err "成功日志未识别"
+    rc=1
+  fi
+  if [[ "$(classify_service_log 'FATAL failed to load server config storage is probably misconfigured')" != "failed" ]]; then
+    err "失败日志未识别"
+    rc=1
+  fi
+  if [[ "$(classify_service_log $'FATAL old leftover\nINFO server up and running')" != "ready" ]]; then
+    err "同时含成功句时应判 ready"
+    rc=1
+  fi
+  if [[ "$(classify_service_log 'INFO server mode')" != "pending" ]]; then
+    err "进行中日志未识别"
+    rc=1
+  fi
+
+  info "测试首次失败回滚后重跑会保留密码并修好 ACME 权限…"
+  local rerun_dir keep_pw
+  rerun_dir="${testdir}/rerun-install"
+  PREFIX="$rerun_dir"
+  SANDBOX=1
+  SKIP_SYSTEMD=1
+  ASSUME_YES=1
+  init_paths
+  mkdir -p "$ETC_DIR" "$ACME_DIR" "$LOG_DIR"
+  AUTH_PASSWORD='RerunKeepPass_xyz'
+  NODE_NAME='HY2-重跑'
+  PORT='443'
+  DOMAIN='keep.example.com'
+  SNI='keep.example.com'
+  ACME_EMAIL='hy2-acme@keep.example.com'
+  TLS_MODE='acme'
+  TLS_CERT=''
+  TLS_KEY=''
+  export_runtime_env
+  save_state
+  write_server_config
+  write_client_files
+  chmod 0750 "$ACME_DIR"
+  prepare_rollback_snapshots
+  NEW_UNIT_WRITTEN=1
+  rollback_install
+  if [[ ! -f "$STATE_FILE" ]]; then
+    err "回滚后状态文件不应丢失"
+    rc=1
+  fi
+  keep_pw="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("password") or "")' "$STATE_FILE")"
+  if [[ "$keep_pw" != "RerunKeepPass_xyz" ]]; then
+    err "回滚后密码被改变"
+    rc=1
+  fi
+  # 回滚会调用 fix_permissions，ACME 应变为 0700
+  if [[ "$(stat -c '%a' "$ACME_DIR")" != "700" ]]; then
+    err "回滚后 ACME 目录权限不是 700，得到 $(stat -c '%a' "$ACME_DIR")"
+    rc=1
+  fi
+  AUTH_PASSWORD='SHOULD_NOT_REPLACE'
+  load_or_create_identity
+  export_runtime_env
+  write_server_config
+  write_client_files
+  fix_permissions
+  assert_runtime_access
+  if [[ "$AUTH_PASSWORD" != "RerunKeepPass_xyz" ]]; then
+    err "重跑未保留原密码：$AUTH_PASSWORD"
+    rc=1
+  fi
+  if [[ "$(stat -c '%a' "$ACME_DIR")" != "700" ]]; then
+    err "重跑后 ACME 目录权限不是 700"
+    rc=1
+  fi
+  if [[ "$(stat -c '%a' "$CONFIG_FILE")" != "640" ]]; then
+    err "重跑后配置权限不是 640"
+    rc=1
+  fi
+  if [[ "$(stat -c '%a' "$LINK_FILE")" != "600" ]]; then
+    err "重跑后客户端链接权限不是 600"
+    rc=1
+  fi
+  info "回滚后重跑保留密码并修正 ACME 权限通过"
+  # 恢复后续自检使用的 prefix，避免破坏后面的二进制沙箱测试
+  PREFIX="${testdir}/prefix"
+  init_paths
+  SANDBOX=1
+  SKIP_SYSTEMD=1
+  ASSUME_YES=0
+  NEW_UNIT_WRITTEN=0
+  SERVICE_STARTED_THIS_RUN=0
+  NEW_SYSCTL_WRITTEN=0
+  PREV_CONFIG_BAK=''
+  PREV_STATE_BAK=''
+  PREV_LINK_BAK=''
+  PREV_MIHOMO_BAK=''
+  PREV_UNIT_BAK=''
+  PREV_BIN_BAK=''
+  PREV_SYSCTL_BAK=''
 
   info "测试脚本钉死的下载地址不含 latest…"
   # shellcheck disable=SC2016  # 有意匹配源码中的变量字面量，不是要展开
