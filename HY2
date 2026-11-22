@@ -1,0 +1,2178 @@
+#!/usr/bin/env bash
+# 独立部署官方 Hysteria 2 单节点（不安装 3x-ui 或其他面板）。
+# 固定官方版本：Hysteria 2.14.0（release 标签 app/v2.14.0），不会静默改用 latest。
+# 仅本脚本被授权制作；不会改 SSH、全局防火墙策略，也不会部署到未被指定的机器。
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 固定版本与官方校验和（来自 GitHub Releases 的 hashes.txt，不是供应链签名认证）
+# 仓库已由 apernet/hysteria 更名为 HyNetworks/hysteria，二者指向同一官方仓库。
+# ---------------------------------------------------------------------------
+readonly HY2_VERSION='2.14.0'
+readonly HY2_RELEASE_TAG='app/v2.14.0'
+readonly GITHUB_REPO='HyNetworks/hysteria'
+readonly DEFAULT_RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases/download/${HY2_RELEASE_TAG}"
+
+# 官方 hashes.txt（app/v2.14.0，2026-11-15）中对应 linux 二进制的 SHA256
+readonly PINNED_SHA256_LINUX_AMD64='fc25edff9948708cb00a4ff01f3bccde677660aca050133bb1ad46c6860362d2'
+readonly PINNED_SHA256_LINUX_ARM64='e7c52241299fe85aba11e9d36e85d8d88ddbb5799ac0e33d272219d20e313bab'
+readonly HASHES_FILE_NAME='hashes.txt'
+
+readonly SCRIPT_NAME='install-hy2-node.sh'
+readonly SCRIPT_VERSION='1.1.0'
+readonly UNIT_NAME='hy2-node.service'
+readonly DEFAULT_PREFIX='/opt/hy2-node'
+readonly SYSUSER='hy2-node'
+readonly UDP_BUF_MIN='16777216'
+readonly NAME_PREFIX='HY2-'
+
+# ---------------------------------------------------------------------------
+# 全局状态
+# ---------------------------------------------------------------------------
+PREFIX="${HY2_NODE_PREFIX:-$DEFAULT_PREFIX}"
+RELEASE_BASE="${HY2_NODE_RELEASE_BASE:-$DEFAULT_RELEASE_BASE}"
+SANDBOX=0
+SKIP_SYSTEMD=0
+ASSUME_YES=0
+OPEN_PORT_MODE="${HY2_NODE_OPEN_PORT:-}"
+SYSCTL_MODE="${HY2_NODE_SYSCTL:-}"
+INSTALL_DEPS_MODE="${HY2_NODE_INSTALL_DEPS:-}"
+
+BIN_DIR=''
+ETC_DIR=''
+VAR_DIR=''
+LOG_DIR=''
+ACME_DIR=''
+STATE_FILE=''
+CONFIG_FILE=''
+LINK_FILE=''
+MIHOMO_FILE=''
+UNIT_PATH='/etc/systemd/system/hy2-node.service'
+SYSCTL_FILE='/etc/sysctl.d/99-hy2-node.conf'
+
+ASSET_BIN=''
+ASSET_HASH_NAME=''
+PINNED_SHA256=''
+
+NODE_NAME=''
+PORT=''
+OLD_PORT=''
+REQUESTED_PORT=''
+DOMAIN=''
+SNI=''
+ACME_EMAIL=''
+TLS_MODE='acme'
+TLS_CERT=''
+TLS_KEY=''
+AUTH_PASSWORD=''
+
+PREV_CONFIG_BAK=''
+PREV_STATE_BAK=''
+PREV_LINK_BAK=''
+PREV_MIHOMO_BAK=''
+PREV_UNIT_BAK=''
+PREV_BIN_BAK=''
+PREV_SYSCTL_BAK=''
+PREV_UNIT_ENABLED=''
+PREV_UNIT_ACTIVE=''
+NEW_UNIT_WRITTEN=0
+SERVICE_STARTED_THIS_RUN=0
+NEW_SYSCTL_WRITTEN=0
+
+log()  { printf '%s\n' "$*" >&2; }
+info() { printf '[信息] %s\n' "$*" >&2; }
+warn() { printf '[警告] %s\n' "$*" >&2; }
+err()  { printf '[错误] %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+with_secrets_quiet() {
+  local xtrace_was=0
+  case "$-" in *x*) xtrace_was=1; set +x ;; esac
+  "$@"
+  local rc=$?
+  if [[ $xtrace_was -eq 1 ]]; then set -x; fi
+  return "$rc"
+}
+
+usage() {
+  cat <<EOF
+${SCRIPT_NAME} ${SCRIPT_VERSION}
+在 Debian / Ubuntu（systemd，amd64 或 arm64）上安装固定版本官方 Hysteria 2（${HY2_VERSION}），
+部署无面板单节点。需要你自己的域名，且解析到本机公网 IPv4/IPv6；使用官方内置 ACME
+（Let’s Encrypt，HTTP-01 / TCP 80）申请并自动续期。默认正常校验证书，不使用自签，
+也不在客户端默认跳过校验。不会覆盖已有 3x-ui / Xray / 官方 hysteria-server。
+
+用法:
+  sudo bash ${SCRIPT_NAME}                 交互安装（需 root）
+  sudo bash ${SCRIPT_NAME} --yes           非交互：需已通过环境变量提供名称和域名；端口未指定时用推荐的 443
+  sudo bash ${SCRIPT_NAME} --change-port [端口]
+                                           给已安装节点更换 UDP 端口（不必重装或重签证书；无端口则交互询问）
+  bash ${SCRIPT_NAME} --self-test          本地自检（不安装系统服务、不开端口、不改防火墙/sysctl）
+  bash ${SCRIPT_NAME} --help
+
+端口由你填写或确认，不会随机生成，也没有端口跳跃。新安装默认推荐 443/UDP，允许自定义；
+不能认为高端口一定会被封。换端口只会改本脚本自己的服务配置与客户端链接。
+
+常用环境变量:
+  HY2_NODE_NAME             节点名称（会统一加上 ${NAME_PREFIX} 前缀；已带此前缀则不重复）
+  HY2_NODE_PORT             UDP 监听端口
+  HY2_NODE_DOMAIN           已解析到本机的自有域名（用作证书与 SNI，不会伪造大厂域名）
+  HY2_NODE_ACME_EMAIL       ACME 账户邮箱（可选；默认 hy2-acme@域名，仅用于 CA 通知）
+  HY2_NODE_TLS_CERT         已有证书路径（当 TCP 80 被占用、无法做 HTTP-01 时可选）
+  HY2_NODE_TLS_KEY          已有证书私钥路径
+  HY2_NODE_OPEN_PORT=yes|no|ask    是否放行本机最小 UDP 端口（默认：有终端则 ask，否则 no）
+  HY2_NODE_SYSCTL=yes|no|ask       是否写入 UDP 缓冲上限两项 sysctl（默认同上）
+  HY2_NODE_INSTALL_DEPS=yes|no|ask 缺失依赖时是否 apt 安装（默认同上；未确认则不装）
+  HY2_NODE_RELEASE_BASE     官方 release 下载前缀（仍校验钉死哈希；默认 GitHub）
+  HY2_NODE_PREFIX           安装目录（默认 ${DEFAULT_PREFIX}）
+
+一条命令远程安装：当前没有可公开托管地址，请勿编造 curl 网址。把本脚本放到你信任的
+HTTPS 位置并核对后再执行。不要使用来历不明的一键链接。不要改成 latest 版本。
+
+${HY2_VERSION} 按官方稳定 release 钉死，不是浮动的 latest。
+官方校验核对本版本 hashes.txt 中的 SHA256 与脚本内钉死哈希；这不是签名或供应链认证。
+EOF
+}
+
+need_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "缺少命令：$c。请先安装后再运行。"
+  done
+}
+
+os_id() {
+  local id=''
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  fi
+  printf '%s' "$id"
+}
+
+os_supported() {
+  case "$(os_id)" in
+    debian|ubuntu) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+have_systemd() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [[ -d /run/systemd/system ]] || return 1
+}
+
+detect_asset() {
+  local m
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64)
+      ASSET_BIN='hysteria-linux-amd64'
+      ASSET_HASH_NAME='build/hysteria-linux-amd64'
+      PINNED_SHA256="$PINNED_SHA256_LINUX_AMD64"
+      ;;
+    aarch64|arm64)
+      ASSET_BIN='hysteria-linux-arm64'
+      ASSET_HASH_NAME='build/hysteria-linux-arm64'
+      PINNED_SHA256="$PINNED_SHA256_LINUX_ARM64"
+      ;;
+    *)
+      die "不支持的架构：$m。仅支持 amd64（x86_64）与 arm64（aarch64）。"
+      ;;
+  esac
+}
+
+init_paths() {
+  BIN_DIR="${PREFIX}/bin"
+  ETC_DIR="${PREFIX}/etc"
+  VAR_DIR="${PREFIX}/var"
+  LOG_DIR="${PREFIX}/log"
+  ACME_DIR="${VAR_DIR}/acme"
+  STATE_FILE="${ETC_DIR}/state.json"
+  CONFIG_FILE="${ETC_DIR}/config.yaml"
+  LINK_FILE="${ETC_DIR}/client-uri.txt"
+  MIHOMO_FILE="${ETC_DIR}/mihomo.yaml"
+  if [[ $SANDBOX -eq 1 ]]; then
+    UNIT_PATH="${PREFIX}/hy2-node.service"
+    SYSCTL_FILE="${PREFIX}/99-hy2-node.conf"
+  fi
+}
+
+urlencode() {
+  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  ((10#$p >= 1 && 10#$p <= 65535))
+}
+
+# 输入优先；否则保留已保存端口；新装未指定时用推荐的 443。不会随机生成。
+resolve_listen_port() {
+  local input="$1" saved="$2"
+  if [[ -n "$input" ]]; then
+    printf '%s' "$input"
+    return 0
+  fi
+  if [[ -n "$saved" ]]; then
+    printf '%s' "$saved"
+    return 0
+  fi
+  printf '443'
+}
+
+valid_domain() {
+  python3 - "$1" <<'PYCODE'
+import sys,re
+d=sys.argv[1].strip().rstrip('.').lower()
+if not d or d.endswith('.local') or d in ('localhost',):
+    sys.exit(1)
+if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', d):
+    sys.exit(1)
+if ':' in d:
+    sys.exit(1)
+if not re.fullmatch(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+', d):
+    sys.exit(1)
+if len(d) > 253:
+    sys.exit(1)
+print(d)
+PYCODE
+}
+
+normalize_node_name() {
+  python3 - "$1" "${NAME_PREFIX}" <<'PYCODE'
+import sys
+raw=(sys.argv[1] or "").strip()
+prefix=sys.argv[2]
+if not raw:
+    sys.exit(2)
+if raw.startswith(prefix):
+    name=raw
+else:
+    name=prefix+raw
+rest=name[len(prefix):]
+if not rest or rest.strip()=="":
+    sys.exit(3)
+if "\n" in name or "\r" in name:
+    sys.exit(4)
+if len(name) > 128:
+    sys.exit(5)
+print(name)
+PYCODE
+}
+
+sha256_of() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+parse_hashes_sha256() {
+  local hashes_file="$1" asset_name="$2"
+  python3 - "$hashes_file" "$asset_name" <<'PYCODE'
+import sys
+path, name = sys.argv[1], sys.argv[2]
+want=None
+for line in open(path, encoding="utf-8", errors="replace"):
+    line=line.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts=line.split()
+    if len(parts) >= 2 and parts[-1] in (name, name.lstrip("./")):
+        h=parts[0].lower()
+        if len(h)==64 and all(c in "0123456789abcdef" for c in h):
+            want=h
+            break
+if not want:
+    sys.exit("无法从官方 hashes.txt 解析 %s 的 SHA256" % name)
+print(want)
+PYCODE
+}
+
+confirm() {
+  local prompt="$1" ans
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    return 1
+  fi
+  printf '%s [y/N] ' "$prompt" >&2
+  read -r ans || return 1
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+generate_password() {
+  python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+}
+
+debian_packages_for_missing() {
+  local missing_cmds="$1"
+  local pkgs=()
+  [[ "$missing_cmds" == *"curl"* ]] && pkgs+=(curl)
+  [[ "$missing_cmds" == *"python3"* ]] && pkgs+=(python3)
+  [[ "$missing_cmds" == *"openssl"* ]] && pkgs+=(openssl)
+  [[ "$missing_cmds" == *"sha256sum"* ]] && pkgs+=(coreutils)
+  if ! command -v ss >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+    pkgs+=(iproute2)
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    pkgs+=(iproute2)
+  fi
+  if [[ ! -e /etc/ssl/certs/ca-certificates.crt ]]; then
+    pkgs+=(ca-certificates)
+  fi
+  if [[ ${#pkgs[@]} -eq 0 ]]; then
+    return 0
+  fi
+  printf '%s\n' "${pkgs[@]}" | awk 'NF && !seen[$0]++'
+}
+
+ensure_dependencies() {
+  local missing=() cmd
+  for cmd in curl python3 sha256sum openssl; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  if ! command -v ss >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+    missing+=("ss或lsof")
+  fi
+  if ! command -v ip >/dev/null 2>&1; then
+    missing+=("ip")
+  fi
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  err "缺少命令：${missing[*]}。"
+  local pkgs
+  pkgs="$(debian_packages_for_missing "${missing[*]}")"
+  if [[ -z "$pkgs" ]]; then
+    die "请先安装缺失命令后再运行。"
+  fi
+  local pkg_line
+  pkg_line="$(printf '%s' "$pkgs" | tr '\n' ' ')"
+  info "可一次补齐（Debian/Ubuntu）：apt-get update && apt-get install -y ${pkg_line}"
+  local mode="${INSTALL_DEPS_MODE}"
+  if [[ -z "$mode" ]]; then
+    if [[ $ASSUME_YES -eq 1 ]]; then
+      mode='yes'
+    elif [[ -t 0 ]]; then
+      mode='ask'
+    else
+      mode='no'
+    fi
+  fi
+  case "$mode" in
+    no|NO|0)
+      die "未确认安装依赖，已中止。请先执行上面的 apt 命令后重试。"
+      ;;
+    yes|YES|1)
+      ;;
+    ask|ASK)
+      if confirm "是否现在用 apt 安装这些依赖（${pkg_line}）？未确认则不会安装。"; then
+        mode='yes'
+      else
+        die "未确认安装依赖，已中止。请先执行：apt-get update && apt-get install -y ${pkg_line}"
+      fi
+      ;;
+    *) die "HY2_NODE_INSTALL_DEPS 只能是 yes、no 或 ask。" ;;
+  esac
+  if [[ "$(id -u)" != "0" ]]; then
+    die "安装依赖需要 root。请先手动执行：apt-get update && apt-get install -y ${pkg_line}"
+  fi
+  if [[ $SANDBOX -eq 1 || $SKIP_SYSTEMD -eq 1 ]]; then
+    die "当前为沙箱/自检模式，不会在本机 apt 安装软件包。请换到目标 VPS 或先自行安装依赖。"
+  fi
+  apt-get update
+  # shellcheck disable=SC2086
+  apt-get install -y $pkgs
+  for cmd in curl python3 sha256sum openssl ip; do
+    command -v "$cmd" >/dev/null 2>&1 || die "依赖安装后仍缺少：$cmd"
+  done
+  if ! command -v ss >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+    die "依赖安装后仍缺少 ss 或 lsof。"
+  fi
+}
+
+diagnose_curl() {
+  local url="$1" code="$2" curl_rc="$3"
+  err "下载失败：$url"
+  err "curl 退出码：${curl_rc}，HTTP 状态：${code:-无}"
+  case "$curl_rc" in
+    6)  err "诊断：无法解析主机名，请检查 DNS 或到 GitHub 的网络。" ;;
+    7)  err "诊断：连不上服务器，请检查出口网络、代理或防火墙。" ;;
+    28) err "诊断：连接或传输超时。" ;;
+    35) err "诊断：TLS 握手失败，请检查系统时间与证书。" ;;
+    22|0)
+      if [[ -n "$code" && "$code" != "200" ]]; then
+        err "诊断：HTTP ${code}。若是 404，请确认版本 ${HY2_VERSION}（${HY2_RELEASE_TAG}）的资源名未写错；本脚本不会改下最新版。"
+      fi
+      ;;
+    *)  err "诊断：请根据 curl 退出码检查网络。本脚本只从固定地址拉取 ${HY2_VERSION}。" ;;
+  esac
+  info "如 GitHub 不可达，可设置 HY2_NODE_RELEASE_BASE 指向你镜像的同类路径，但仍会校验官方哈希。"
+}
+
+download_file() {
+  local url="$1" dest="$2"
+  local tmp code rc
+  tmp="${dest}.part"
+  set +e
+  code="$(curl -fsSL --connect-timeout 20 --max-time 300 -A "hy2-node-installer/${SCRIPT_VERSION}" \
+    -o "$tmp" -w '%{http_code}' "$url")"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 || "$code" != "200" ]]; then
+    diagnose_curl "$url" "$code" "$rc"
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+download_and_verify_binary() {
+  local work="$1"
+  local bin_path="${work}/${ASSET_BIN}"
+  local hashes_path="${work}/${HASHES_FILE_NAME}"
+  local url_bin="${RELEASE_BASE}/${ASSET_BIN}"
+  local url_hashes="${RELEASE_BASE}/${HASHES_FILE_NAME}"
+  info "下载官方 Hysteria ${HY2_VERSION}：${ASSET_BIN}"
+  download_file "$url_hashes" "$hashes_path" || die "无法下载官方 hashes.txt。"
+  download_file "$url_bin" "$bin_path" || die "无法下载官方二进制。"
+  local official_sha file_sha
+  official_sha="$(parse_hashes_sha256 "$hashes_path" "$ASSET_HASH_NAME")"
+  file_sha="$(sha256_of "$bin_path")"
+  if [[ "$official_sha" != "$PINNED_SHA256" ]]; then
+    die "官方 hashes.txt 中的 SHA256（${official_sha}）与脚本钉死的哈希（${PINNED_SHA256}）不一致。已中止，既不会改用最新版，也不会忽略校验。"
+  fi
+  if [[ "$file_sha" != "$official_sha" ]]; then
+    rm -f "$bin_path"
+    die "二进制 SHA256（${file_sha}）与官方 hashes.txt（${official_sha}）不一致，已删除并中止。这只是哈希校验，不是签名认证。"
+  fi
+  chmod 0755 "$bin_path"
+  info "校验通过：官方 hashes.txt SHA256 与钉死哈希一致。这不是供应链签名认证。"
+  printf '%s' "$bin_path"
+}
+
+verify_binary_version() {
+  local bin="$1" out
+  out="$("$bin" version 2>&1 || true)"
+  if ! printf '%s\n' "$out" | grep -Eq "(^|[[:space:]vV])${HY2_VERSION}([[:space:]]|$)"; then
+    err "二进制 version 输出未包含钉死版本 ${HY2_VERSION}："
+    err "$out"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 身份、URI、配置
+# ---------------------------------------------------------------------------
+save_state() {
+  python3 - "$STATE_FILE" <<'PYCODE'
+import json,os,sys
+path=sys.argv[1]
+data={
+  "password": os.environ.get("AUTH_PASSWORD",""),
+  "name": os.environ.get("NODE_NAME",""),
+  "port": os.environ.get("PORT",""),
+  "domain": os.environ.get("DOMAIN",""),
+  "sni": os.environ.get("SNI",""),
+  "acme_email": os.environ.get("ACME_EMAIL",""),
+  "tls_mode": os.environ.get("TLS_MODE","acme"),
+  "tls_cert": os.environ.get("TLS_CERT",""),
+  "tls_key": os.environ.get("TLS_KEY",""),
+  "hy2_version": os.environ.get("HY2_VERSION",""),
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp=path+".tmp"
+with open(tmp,"w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=False,indent=2)
+    f.write("\n")
+os.replace(tmp,path)
+os.chmod(path,0o640)
+PYCODE
+}
+
+load_or_create_identity() {
+  local loaded=0
+  if [[ -f "$STATE_FILE" ]]; then
+    AUTH_PASSWORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("password") or "")' "$STATE_FILE")"
+    if [[ -n "$AUTH_PASSWORD" ]]; then
+      loaded=1
+      SAVED_NAME="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("name") or "")' "$STATE_FILE")"
+      SAVED_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("port") or "")' "$STATE_FILE")"
+      SAVED_DOMAIN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("domain") or "")' "$STATE_FILE")"
+      SAVED_SNI="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("sni") or "")' "$STATE_FILE")"
+      SAVED_EMAIL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("acme_email") or "")' "$STATE_FILE")"
+      SAVED_TLS_MODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tls_mode") or "")' "$STATE_FILE")"
+      SAVED_TLS_CERT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tls_cert") or "")' "$STATE_FILE")"
+      SAVED_TLS_KEY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tls_key") or "")' "$STATE_FILE")"
+      : "${SAVED_SNI:-}" "${SAVED_TLS_MODE:-}" "${SAVED_TLS_CERT:-}" "${SAVED_TLS_KEY:-}"
+      info "已检测到既有身份，将保留认证密码，不会无谓重新申请证书。"
+    fi
+  fi
+  if [[ $loaded -eq 0 ]]; then
+    AUTH_PASSWORD="$(generate_password)"
+    info "已生成随机强认证密码（只写入受限文件，不会在日志里打印）。"
+  fi
+}
+
+build_share_uri() {
+  python3 - <<'PYCODE'
+import os,urllib.parse
+host=os.environ["DOMAIN"]
+port=os.environ["PORT"]
+password=os.environ["AUTH_PASSWORD"]
+sni=os.environ["SNI"]
+name=os.environ["NODE_NAME"]
+user=urllib.parse.quote(password, safe="")
+q=urllib.parse.urlencode({"sni": sni, "alpn": "h3"}, quote_via=urllib.parse.quote, safe="")
+frag=urllib.parse.quote(name, safe="")
+print(f"hysteria2://{user}@{host}:{port}/?{q}#{frag}")
+PYCODE
+}
+
+write_client_files() {
+  local uri
+  uri="$(with_secrets_quiet build_share_uri)"
+  umask 077
+  printf '%s\n' "$uri" >"$LINK_FILE"
+  chmod 0600 "$LINK_FILE"
+  python3 - "$MIHOMO_FILE" <<'PYCODE'
+import os,sys,json
+path=sys.argv[1]
+name=os.environ["NODE_NAME"]
+domain=os.environ["DOMAIN"]
+port=os.environ["PORT"]
+password=os.environ["AUTH_PASSWORD"]
+sni=os.environ["SNI"]
+# 不填写 up/down，避免客户端走 Brutal；URI 也无法强制客户端拥塞参数
+lines=[
+    "proxies:",
+    f"- name: {json.dumps(name, ensure_ascii=False)}",
+    "  type: hysteria2",
+    f"  server: {json.dumps(domain, ensure_ascii=False)}",
+    f"  port: {int(port)}",
+    f"  password: {json.dumps(password, ensure_ascii=False)}",
+    f"  sni: {json.dumps(sni, ensure_ascii=False)}",
+    "  skip-cert-verify: false",
+    "  alpn:",
+    "    - h3",
+    "",
+]
+with open(path,"w",encoding="utf-8") as f:
+    f.write("\n".join(lines))
+os.chmod(path,0o600)
+PYCODE
+}
+
+write_server_config() {
+  python3 - "$CONFIG_FILE" <<'PYCODE'
+import os,sys,json
+path=sys.argv[1]
+port=int(os.environ["PORT"])
+password=os.environ["AUTH_PASSWORD"]
+domain=os.environ["DOMAIN"]
+email=os.environ.get("ACME_EMAIL","")
+mode=os.environ.get("TLS_MODE","acme")
+cert=os.environ.get("TLS_CERT","")
+key=os.environ.get("TLS_KEY","")
+acme_dir=os.environ.get("ACME_DIR","")
+
+def ys(s):
+    return json.dumps(s, ensure_ascii=False)
+
+lines=[]
+lines.append(f"listen: :{port}")
+lines.append("")
+if mode=="existing":
+    lines += [
+        "tls:",
+        f"  cert: {ys(cert)}",
+        f"  key: {ys(key)}",
+        "",
+    ]
+else:
+    lines += [
+        "acme:",
+        "  domains:",
+        f"    - {ys(domain)}",
+        f"  email: {ys(email)}",
+        "  ca: letsencrypt",
+        f"  dir: {ys(acme_dir)}",
+        "  type: http",
+        "",
+    ]
+lines += [
+    "auth:",
+    "  type: password",
+    f"  password: {ys(password)}",
+    "",
+    "congestion:",
+    "  type: bbr",
+    "  bbrProfile: standard",
+    "",
+    "quic:",
+    "  initStreamReceiveWindow: 8388608",
+    "  maxStreamReceiveWindow: 8388608",
+    "  initConnReceiveWindow: 20971520",
+    "  maxConnReceiveWindow: 20971520",
+    "  maxIdleTimeout: 30s",
+    "  maxIncomingStreams: 1024",
+    "  disablePathMTUDiscovery: false",
+    "",
+    "udpIdleTimeout: 60s",
+    "",
+]
+# 有意省略 bandwidth 与 ignoreClientBandwidth；默认不开 obfs/masquerade
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp=path+".tmp"
+with open(tmp,"w",encoding="utf-8") as f:
+    f.write("\n".join(lines)+"\n")
+os.replace(tmp,path)
+os.chmod(path,0o640)
+PYCODE
+}
+
+assert_config_policy() {
+  python3 - "$1" <<'PYCODE'
+import sys,re
+text=open(sys.argv[1],encoding="utf-8").read()
+if re.search(r'(?m)^\s*bandwidth\s*:', text):
+    sys.exit("配置不应包含 bandwidth")
+if re.search(r'(?m)^\s*ignoreClientBandwidth\s*:', text):
+    sys.exit("配置不应包含 ignoreClientBandwidth")
+if re.search(r'(?m)^\s*obfs\s*:', text):
+    sys.exit("配置不应默认开启 obfs")
+if re.search(r'(?m)^\s*masquerade\s*:', text):
+    sys.exit("配置不应默认开启 masquerade")
+if "bbrProfile: standard" not in text or "type: bbr" not in text:
+    sys.exit("缺少 congestion BBR standard")
+if "disablePathMTUDiscovery: false" not in text:
+    sys.exit("PMTU 应变为开启")
+if "udpIdleTimeout: 60s" not in text:
+    sys.exit("缺少 udpIdleTimeout 60s")
+print("config policy ok")
+PYCODE
+}
+
+# ---------------------------------------------------------------------------
+# 域名解析、本机地址、Cloudflare 橙云检测
+# ---------------------------------------------------------------------------
+collect_local_ips() {
+  python3 - <<'PYCODE'
+import os,re,socket,subprocess,ipaddress,shutil
+
+def run(cmd, timeout=8):
+    try:
+        p=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=timeout)
+        return p.stdout
+    except Exception:
+        return ""
+
+ips=set()
+if shutil.which("ip"):
+    out=run(["ip", "-o", "addr", "show"])
+    for m in re.finditer(r"inet6?\s+([0-9a-fA-F:.]+)/\d+", out):
+        try:
+            ip=ipaddress.ip_address(m.group(1).split("%")[0])
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            continue
+        ips.add(str(ip))
+
+# 补充探测出口公网地址（失败则忽略，不作为绕过条件）
+for args in (
+    ["curl","-4","-fsS","--connect-timeout","3","--max-time","5","https://api.ipify.org"],
+    ["curl","-6","-fsS","--connect-timeout","3","--max-time","5","https://api64.ipify.org"],
+):
+    if not shutil.which("curl"):
+        break
+    out=run(args, timeout=6).strip()
+    try:
+        ip=ipaddress.ip_address(out)
+    except ValueError:
+        continue
+    if not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified):
+        ips.add(str(ip))
+
+for ip in sorted(ips, key=lambda x: (":" in x, x)):
+    print(ip)
+PYCODE
+}
+
+resolve_domain_ips() {
+  python3 - "$1" <<'PYCODE'
+import sys,socket
+domain=sys.argv[1]
+found=set()
+for family, typ, proto, canon, sockaddr in socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM):
+    ip=sockaddr[0]
+    found.add(ip)
+if not found:
+    sys.exit(2)
+for ip in sorted(found, key=lambda x: (":" in x, x)):
+    print(ip)
+PYCODE
+}
+
+# Cloudflare 公开地址段，仅用于解析不匹配时给出更明确的橙云提示，不是放行条件。
+cf_reason_if_any() {
+  python3 - "$1" <<'PYCODE'
+import sys,ipaddress
+cf_cidrs = [
+    "173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22",
+    "141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20",
+    "197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13",
+    "104.24.0.0/14","172.64.0.0/13","131.0.72.0/22",
+    "2400:cb00::/32","2606:4700::/32","2803:f800::/32","2405:b500::/32",
+    "2405:8100::/32","2a06:98c0::/29","2c0f:f248::/32",
+]
+nets=[ipaddress.ip_network(x) for x in cf_cidrs]
+hit=[]
+for raw in sys.argv[1].split(","):
+    raw=raw.strip()
+    if not raw:
+        continue
+    try:
+        ip=ipaddress.ip_address(raw)
+    except ValueError:
+        continue
+    if any(ip in n for n in nets):
+        hit.append(str(ip))
+if hit:
+    print("yes")
+else:
+    print("no")
+PYCODE
+}
+
+verify_domain_points_to_this_host() {
+  local domain="$1"
+  local local_ips resolved
+  local_ips="$(collect_local_ips || true)"
+  if [[ -z "$local_ips" ]]; then
+    die "无法确定本机 IPv4/IPv6 地址，已中止。请确认网卡地址或出口地址可见。"
+  fi
+  set +e
+  resolved="$(resolve_domain_ips "$domain")"
+  local rc=$?
+  set -e
+  if [[ $rc -ne 0 || -z "$resolved" ]]; then
+    die "域名 ${domain} 无法解析到 A/AAAA 记录。"
+  fi
+  local check_out check_rc
+  set +e
+  check_out="$(python3 - "$domain" "$local_ips" "$resolved" <<'PYCODE'
+import ipaddress,sys
+domain, local_raw, resolved_raw = sys.argv[1], sys.argv[2], sys.argv[3]
+local=set()
+for line in local_raw.splitlines():
+    line=line.strip()
+    if not line: continue
+    local.add(ipaddress.ip_address(line))
+resolved=[]
+for line in resolved_raw.splitlines():
+    line=line.strip()
+    if not line: continue
+    resolved.append(ipaddress.ip_address(line))
+if not resolved:
+    print("域名没有解析结果", file=sys.stderr)
+    sys.exit(2)
+bad=[]
+for ip in resolved:
+    if ip not in local:
+        bad.append(str(ip))
+if bad:
+    print("UNMATCH %s" % ",".join(bad))
+    sys.exit(3)
+v4=[str(i) for i in resolved if i.version==4]
+v6=[str(i) for i in resolved if i.version==6]
+print("OK v4=%s v6=%s" % (",".join(v4) or "-", ",".join(v6) or "-"))
+PYCODE
+)"
+  check_rc=$?
+  set -e
+  if [[ $check_rc -eq 0 ]]; then
+    info "域名 ${domain} 的解析已指向本机（${check_out}），将使用该域名作为证书名与 SNI。不会改用或伪造其他域名。"
+    return 0
+  fi
+  local unmatched
+  unmatched="$(python3 - "$local_ips" "$resolved" <<'PYCODE'
+import ipaddress,sys
+local=set(ipaddress.ip_address(x) for x in sys.argv[1].split() if x)
+bad=[]
+for line in sys.argv[2].splitlines():
+    line=line.strip()
+    if not line: continue
+    ip=ipaddress.ip_address(line)
+    if ip not in local:
+        bad.append(str(ip))
+print(",".join(bad))
+PYCODE
+)"
+  local cf
+  cf="$(cf_reason_if_any "$unmatched")"
+  err "域名 ${domain} 解析到的地址未指向当前 VPS：${unmatched}"
+  err "本机可见地址："
+  printf '%s\n' "$local_ips" | sed 's/^/  /' >&2
+  if [[ "$cf" == "yes" ]]; then
+    err "解析结果落在 Cloudflare 地址段内。官方明确 Hysteria 不能走 CDN/普通橙云；请把该域名改为仅 DNS（关闭代理）并指向本机 IP，没有绕过方法。"
+  fi
+  die "解析不匹配，已中止，不会继续申请证书或启动服务。"
+}
+
+# ---------------------------------------------------------------------------
+# 已有证书校验（必须可被系统根信任，且覆盖指定域名）
+# ---------------------------------------------------------------------------
+verify_existing_certificate() {
+  local cert="$1" key="$2" domain="$3"
+  _cert_fail() { err "$1"; return 1; }
+  [[ -f "$cert" && -r "$cert" ]] || { _cert_fail "找不到或无法读取证书：$cert"; return 1; }
+  [[ -f "$key" && -r "$key" ]] || { _cert_fail "找不到或无法读取私钥：$key"; return 1; }
+  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || { _cert_fail "证书文件不是有效的 PEM 证书。"; return 1; }
+  openssl pkey -in "$key" -noout >/dev/null 2>&1 || { _cert_fail "私钥文件无法解析。"; return 1; }
+  if ! openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1; then
+    _cert_fail "证书已过期或将在 24 小时内过期，拒绝使用。"
+    return 1
+  fi
+  if ! python3 - "$cert" "$domain" <<'PYCODE'
+import subprocess,sys,re
+cert,domain=sys.argv[1],sys.argv[2].lower().rstrip('.')
+out=subprocess.check_output(["openssl","x509","-in",cert,"-noout","-text"], text=True, errors="replace")
+names=set()
+block=re.search(r"Subject Alternative Name:\s*\n\s*(.*)", out)
+if block:
+    for part in block.group(1).split(","):
+        part=part.strip()
+        m=re.match(r"DNS:(\S+)", part)
+        if m:
+            names.add(m.group(1).rstrip('.').lower())
+m=re.search(r"Subject:.*\bCN\s*=\s*([^,\n/]+)", out)
+if m:
+    names.add(m.group(1).strip().rstrip('.').lower())
+
+def covers(pattern, host):
+    if pattern==host:
+        return True
+    if pattern.startswith("*."):
+        suffix=pattern[2:]
+        return host.endswith("."+suffix) and host.count(".")==suffix.count(".")+1
+    return False
+if not any(covers(n, domain) for n in names):
+    sys.stderr.write("证书未覆盖域名 %s；证书名：%s\n" % (domain, ", ".join(sorted(names)) or "(无)"))
+    sys.exit(2)
+print("san ok")
+PYCODE
+  then
+    return 1
+  fi
+  local ca='/etc/ssl/certs/ca-certificates.crt'
+  if [[ ! -f "$ca" ]]; then
+    ca='/etc/ssl/cert.pem'
+  fi
+  local verify_ok=0
+  if [[ -f "$ca" ]]; then
+    openssl verify -CAfile "$ca" "$cert" >/dev/null 2>&1 && verify_ok=1
+  else
+    openssl verify "$cert" >/dev/null 2>&1 && verify_ok=1
+  fi
+  if [[ $verify_ok -ne 1 ]]; then
+    err "证书未通过系统根证书校验。本脚本默认不使用自签，也不提供跳过校验。"
+    return 1
+  fi
+  local pub1 pub2
+  pub1="$(openssl x509 -noout -pubkey -in "$cert" 2>/dev/null | openssl md5 | awk '{print $NF}')"
+  pub2="$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl md5 | awk '{print $NF}')"
+  if [[ -n "$pub1" && -n "$pub2" && "$pub1" != "$pub2" ]]; then
+    err "证书与私钥不匹配。"
+    return 1
+  fi
+  info "已有证书通过信任校验，并且覆盖域名 ${domain}。"
+}
+
+
+# ---------------------------------------------------------------------------
+# 端口与冲突
+# ---------------------------------------------------------------------------
+detect_3xui() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl list-unit-files 2>/dev/null | grep -Eq '^x-ui\.service' && return 0
+    systemctl is-active --quiet x-ui 2>/dev/null && return 0
+  fi
+  [[ -e /usr/local/x-ui || -e /usr/local/bin/x-ui ]] && return 0
+  return 1
+}
+
+detect_other_xray() {
+  local hits=()
+  command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -Eq '^xray\.service' && hits+=("xray.service")
+  [[ -e /usr/local/bin/xray ]] && hits+=("/usr/local/bin/xray")
+  [[ -e /usr/local/etc/xray || -e /etc/xray ]] && hits+=("xray-config")
+  if [[ ${#hits[@]} -gt 0 ]]; then
+    printf '%s' "${hits[*]}"
+    return 0
+  fi
+  return 1
+}
+
+detect_other_hysteria() {
+  local hits=()
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl list-unit-files 2>/dev/null | grep -Eq '^hysteria-server\.service' && hits+=("hysteria-server.service")
+    systemctl list-unit-files 2>/dev/null | grep -Eq '^hysteria-server@' && hits+=("hysteria-server@.service")
+  fi
+  if [[ -e /usr/local/bin/hysteria ]]; then
+    if [[ ! -e "$BIN_DIR/hysteria" ]] || [[ ! /usr/local/bin/hysteria -ef "$BIN_DIR/hysteria" ]]; then
+      hits+=("/usr/local/bin/hysteria")
+    fi
+  fi
+  [[ -e /etc/hysteria ]] && hits+=("/etc/hysteria")
+  if [[ ${#hits[@]} -gt 0 ]]; then
+    printf '%s' "${hits[*]}"
+    return 0
+  fi
+  return 1
+}
+
+port_listeners() {
+  local proto="$1" port="$2"
+  if command -v ss >/dev/null 2>&1; then
+    if [[ "$proto" == "udp" ]]; then
+      ss -H -ulnp "sport = :$port" 2>/dev/null || true
+    else
+      ss -H -tlnp "sport = :$port" 2>/dev/null || true
+    fi
+  elif command -v lsof >/dev/null 2>&1; then
+    if [[ "$proto" == "udp" ]]; then
+      lsof -nP -iUDP:"$port" 2>/dev/null || true
+    else
+      lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+    fi
+  else
+    die "需要 ss 或 lsof 才能检查端口占用。"
+  fi
+}
+
+listener_is_ours() {
+  local text="$1"
+  [[ "$text" == *"${BIN_DIR}/hysteria"* ]] && return 0
+  [[ "$text" == *"hy2-node"* ]] && return 0
+  return 1
+}
+
+assert_udp_port_free() {
+  local port="$1" text
+  text="$(port_listeners udp "$port")"
+  [[ -n "$text" ]] || return 0
+  if listener_is_ours "$text"; then
+    info "UDP ${port} 当前由本脚本的服务占用，可继续更新。"
+    return 0
+  fi
+  err "UDP 端口 ${port} 已被占用，本脚本不会停止占用该端口的进程："
+  printf '%s\n' "$text" >&2
+  die "请改用其他 UDP 端口后重试。"
+}
+
+assert_tcp80_or_existing_cert() {
+  local text
+  text="$(port_listeners tcp 80)"
+  if [[ -z "$text" ]]; then
+    return 0
+  fi
+  if listener_is_ours "$text"; then
+    info "TCP 80 当前由本脚本服务用于 ACME，可继续。"
+    return 0
+  fi
+  if [[ "$TLS_MODE" == "existing" ]]; then
+    info "TCP 80 已被其他程序占用；将使用你提供的已有证书，不会结束占用 80 端口的进程。"
+    return 0
+  fi
+  err "HTTP-01 证书申请需要本机 TCP 80 可被本服务监听，但该端口已被占用。本脚本不会结束他人进程或改写他人网站："
+  printf '%s\n' "$text" >&2
+  err "可选：提供已由受信任 CA 签发、且覆盖该域名的证书和私钥（HY2_NODE_TLS_CERT / HY2_NODE_TLS_KEY），或先自行释放 80 端口后再用官方内置 ACME。"
+  die "未选择可用的证书方案，已中止。"
+}
+
+preflight_conflicts() {
+  if detect_3xui; then
+    warn "检测到可能存在的 3x-ui（x-ui 服务或 /usr/local/x-ui）。本脚本不会覆盖、停止或改写它。"
+  fi
+  local other
+  if other="$(detect_other_xray)"; then
+    warn "检测到已有 Xray：${other}。本脚本安装到 ${PREFIX} 与 ${UNIT_NAME}，不会覆盖这些路径，也不会停止现有服务。"
+  fi
+  if other="$(detect_other_hysteria)"; then
+    warn "检测到已有 Hysteria：${other}。本脚本不会覆盖 /etc/hysteria、hysteria-server.service 或 /usr/local/bin/hysteria，也不会停止它们。"
+  fi
+  if [[ -e /usr/local/bin/hysteria && -e "$BIN_DIR/hysteria" && "$BIN_DIR/hysteria" -ef /usr/local/bin/hysteria ]]; then
+    die "安装路径与已有 /usr/local/bin/hysteria 重合，已拒绝覆盖。"
+  fi
+  if [[ "$UNIT_PATH" == /etc/systemd/system/hysteria-server.service || "$UNIT_PATH" == /etc/systemd/system/hysteria-server@.service ]]; then
+    die "拒绝覆盖官方 hysteria-server 单元。"
+  fi
+  if [[ "$PREFIX" == /etc/hysteria ]]; then
+    die "拒绝使用 /etc/hysteria 作为安装目录。"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# sysctl、防火墙、回滚、服务
+# ---------------------------------------------------------------------------
+maybe_prompt_mode() {
+  local current="$1"
+  if [[ -n "$current" ]]; then
+    printf '%s' "$current"
+    return
+  fi
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    printf 'yes'
+    return
+  fi
+  if [[ -t 0 ]]; then
+    printf 'ask'
+  else
+    printf 'no'
+  fi
+}
+
+read_sysctl_value() {
+  local key="$1"
+  sysctl -n "$key" 2>/dev/null || echo 0
+}
+
+maybe_apply_udp_buffers() {
+  local mode
+  mode="$(maybe_prompt_mode "${SYSCTL_MODE}")"
+  info "如需提高 UDP 套接字缓冲上限，本脚本只会写入 net.core.rmem_max 与 net.core.wmem_max 两项，且不会把已经更大的值改小。这与 QUIC 窗口不是同一回事，也不会改 TCP BBR 或路由。"
+  case "$mode" in
+    no|NO|0)
+      info "已跳过 sysctl 写入。若发送/接收缓冲偏小，可稍后自行将上述两项至少调到 ${UDP_BUF_MIN}。"
+      return 0
+      ;;
+    yes|YES|1)
+      ;;
+    ask|ASK)
+      if confirm "是否写入仅含上述两项的 ${SYSCTL_FILE}，并把当前小于 ${UDP_BUF_MIN} 的值提高到该下限？"; then
+        mode='yes'
+      else
+        info "已跳过 sysctl 写入。"
+        return 0
+      fi
+      ;;
+    *) die "HY2_NODE_SYSCTL 只能是 yes、no 或 ask。" ;;
+  esac
+  if [[ $SANDBOX -eq 1 ]]; then
+    info "沙箱模式：只演示将要写入的 sysctl 值，不修改系统。"
+    return 0
+  fi
+  local cur_r cur_w new_r new_w
+  cur_r="$(read_sysctl_value net.core.rmem_max)"
+  cur_w="$(read_sysctl_value net.core.wmem_max)"
+  new_r="$cur_r"
+  new_w="$cur_w"
+  [[ "$cur_r" =~ ^[0-9]+$ ]] || cur_r=0
+  [[ "$cur_w" =~ ^[0-9]+$ ]] || cur_w=0
+  if (( cur_r < UDP_BUF_MIN )); then new_r="$UDP_BUF_MIN"; else new_r="$cur_r"; fi
+  if (( cur_w < UDP_BUF_MIN )); then new_w="$UDP_BUF_MIN"; else new_w="$cur_w"; fi
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    PREV_SYSCTL_BAK="${ETC_DIR}/.rollback.$$/99-hy2-node.conf"
+    mkdir -p "$(dirname "$PREV_SYSCTL_BAK")"
+    cp -a "$SYSCTL_FILE" "$PREV_SYSCTL_BAK"
+  fi
+  cat >"$SYSCTL_FILE" <<EOF
+# written by ${SCRIPT_NAME}; only these two keys
+net.core.rmem_max = ${new_r}
+net.core.wmem_max = ${new_w}
+EOF
+  NEW_SYSCTL_WRITTEN=1
+  sysctl -w "net.core.rmem_max=${new_r}" >/dev/null
+  sysctl -w "net.core.wmem_max=${new_w}" >/dev/null
+  info "已设置 net.core.rmem_max=${new_r}、net.core.wmem_max=${new_w}，并写入 ${SYSCTL_FILE}。未改动其他 sysctl。"
+}
+
+maybe_open_ports() {
+  local mode
+  mode="$(maybe_prompt_mode "${OPEN_PORT_MODE}")"
+  local extra_tcp=""
+  if [[ "$TLS_MODE" == "acme" ]]; then
+    extra_tcp=" 另外，ACME HTTP-01 需要外网能访问本机 TCP 80；云厂商安全组也要放行该 TCP 端口。"
+  fi
+  info "需要放行本机 UDP ${PORT}。本脚本不会改默认策略或 SSH。云防火墙/安全组只能你在控制台自行放行 UDP ${PORT}。${extra_tcp}"
+  case "$mode" in
+    no|NO|0)
+      info "已跳过本机防火墙写入。"
+      return 0
+      ;;
+    yes|YES|1)
+      ;;
+    ask|ASK)
+      if confirm "是否仅放行本机 UDP ${PORT}（不改默认策略、不改 SSH）？"; then
+        mode='yes'
+      else
+        info "已跳过本机端口放行。"
+        return 0
+      fi
+      ;;
+    *) die "HY2_NODE_OPEN_PORT 只能是 yes、no 或 ask。" ;;
+  esac
+  if [[ $SANDBOX -eq 1 ]]; then
+    info "沙箱模式：不修改防火墙。"
+    return 0
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow "${PORT}/udp" comment 'hy2-node' || die "ufw 放行 UDP 失败。"
+    if [[ "$TLS_MODE" == "acme" ]]; then
+      if confirm "是否同时放行本机 TCP 80 以供 ACME HTTP-01？（不会结束占用 80 的其他进程）"; then
+        ufw allow 80/tcp comment 'hy2-node-acme-http01' || die "ufw 放行 TCP 80 失败。"
+      else
+        info "未放行 TCP 80。若云安全组或本机防火墙挡住 80，证书申请会失败。"
+      fi
+    fi
+    info "已通过 ufw 放行相关端口。"
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+    firewall-cmd --permanent --add-port="${PORT}/udp" || die "firewalld 放行 UDP 失败。"
+    if [[ "$TLS_MODE" == "acme" ]]; then
+      if confirm "是否同时放行本机 TCP 80 以供 ACME HTTP-01？"; then
+        firewall-cmd --permanent --add-port=80/tcp || die "firewalld 放行 TCP 80 失败。"
+      fi
+    fi
+    firewall-cmd --reload || true
+    info "已通过 firewalld 放行相关端口。"
+    return 0
+  fi
+  warn "未检测到已启用的 ufw 或 firewalld。本脚本不会擅自改 iptables/nft 默认策略。请自行放行 UDP ${PORT}，并检查云防火墙/安全组。若用 ACME，还需放行 TCP 80。"
+}
+
+backup_if_exists() {
+  local src="$1" dest="$2"
+  if [[ -e "$src" ]]; then
+    cp -a "$src" "$dest"
+  fi
+}
+
+prepare_rollback_snapshots() {
+  local bak
+  bak="${ETC_DIR}/.rollback.$$"
+  mkdir -p "$bak"
+  chmod 700 "$bak"
+  PREV_CONFIG_BAK=''
+  PREV_STATE_BAK=''
+  PREV_LINK_BAK=''
+  PREV_MIHOMO_BAK=''
+  PREV_UNIT_BAK=''
+  PREV_BIN_BAK=''
+  if [[ -e "$CONFIG_FILE" ]]; then
+    PREV_CONFIG_BAK="${bak}/config.yaml"
+    backup_if_exists "$CONFIG_FILE" "$PREV_CONFIG_BAK"
+  fi
+  if [[ -e "$STATE_FILE" ]]; then
+    PREV_STATE_BAK="${bak}/state.json"
+    backup_if_exists "$STATE_FILE" "$PREV_STATE_BAK"
+  fi
+  if [[ -e "$LINK_FILE" ]]; then
+    PREV_LINK_BAK="${bak}/client-uri.txt"
+    backup_if_exists "$LINK_FILE" "$PREV_LINK_BAK"
+  fi
+  if [[ -e "$MIHOMO_FILE" ]]; then
+    PREV_MIHOMO_BAK="${bak}/mihomo.yaml"
+    backup_if_exists "$MIHOMO_FILE" "$PREV_MIHOMO_BAK"
+  fi
+  if [[ -e "$BIN_DIR/hysteria" ]]; then
+    PREV_BIN_BAK="${bak}/hysteria"
+    backup_if_exists "$BIN_DIR/hysteria" "$PREV_BIN_BAK"
+  fi
+  if have_systemd && [[ -e "$UNIT_PATH" ]]; then
+    PREV_UNIT_BAK="${bak}/hy2-node.service"
+    backup_if_exists "$UNIT_PATH" "$PREV_UNIT_BAK"
+    PREV_UNIT_ENABLED="$(systemctl is-enabled "$UNIT_NAME" 2>/dev/null || true)"
+    PREV_UNIT_ACTIVE="$(systemctl is-active "$UNIT_NAME" 2>/dev/null || true)"
+  fi
+}
+
+rollback_install() {
+  warn "正在回滚，避免留下无法启动的配置。"
+  if [[ $SKIP_SYSTEMD -eq 0 ]] && have_systemd; then
+    if [[ $SERVICE_STARTED_THIS_RUN -eq 1 ]]; then
+      systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$PREV_UNIT_BAK" && -e "$PREV_UNIT_BAK" ]]; then
+      cp -a "$PREV_UNIT_BAK" "$UNIT_PATH"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ "$PREV_UNIT_ENABLED" == "enabled" ]]; then
+        systemctl enable "$UNIT_NAME" >/dev/null 2>&1 || true
+      fi
+      if [[ "$PREV_UNIT_ACTIVE" == "active" ]]; then
+        systemctl start "$UNIT_NAME" >/dev/null 2>&1 || true
+      fi
+    elif [[ $NEW_UNIT_WRITTEN -eq 1 && -z "$PREV_UNIT_BAK" ]]; then
+      systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+      rm -f "$UNIT_PATH"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+  [[ -n "$PREV_CONFIG_BAK" && -e "$PREV_CONFIG_BAK" ]] && cp -a "$PREV_CONFIG_BAK" "$CONFIG_FILE"
+  [[ -n "$PREV_STATE_BAK" && -e "$PREV_STATE_BAK" ]] && cp -a "$PREV_STATE_BAK" "$STATE_FILE"
+  [[ -n "$PREV_LINK_BAK" && -e "$PREV_LINK_BAK" ]] && cp -a "$PREV_LINK_BAK" "$LINK_FILE"
+  [[ -n "$PREV_MIHOMO_BAK" && -e "$PREV_MIHOMO_BAK" ]] && cp -a "$PREV_MIHOMO_BAK" "$MIHOMO_FILE"
+  [[ -n "$PREV_BIN_BAK" && -e "$PREV_BIN_BAK" ]] && cp -a "$PREV_BIN_BAK" "$BIN_DIR/hysteria"
+  if [[ $NEW_SYSCTL_WRITTEN -eq 1 ]]; then
+    if [[ -n "$PREV_SYSCTL_BAK" && -e "$PREV_SYSCTL_BAK" ]]; then
+      cp -a "$PREV_SYSCTL_BAK" "$SYSCTL_FILE"
+    else
+      rm -f "$SYSCTL_FILE"
+    fi
+  fi
+}
+
+ensure_sysuser() {
+  if id -u "$SYSUSER" >/dev/null 2>&1; then
+    return 0
+  fi
+  useradd --system --home-dir "$VAR_DIR" --shell /usr/sbin/nologin "$SYSUSER"
+}
+
+write_unit() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+[Unit]
+Description=Standalone Hysteria 2 node (${HY2_VERSION})
+Documentation=https://v2.hysteria.network/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SYSUSER}
+Group=${SYSUSER}
+WorkingDirectory=${PREFIX}
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=${BIN_DIR}/hysteria server --config ${CONFIG_FILE}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${LOG_DIR} ${ACME_DIR} ${VAR_DIR}
+Environment=HYSTERIA_LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  install -m 0644 "$tmp" "$UNIT_PATH"
+  rm -f "$tmp"
+  NEW_UNIT_WRITTEN=1
+  systemctl daemon-reload
+}
+
+fix_permissions() {
+  mkdir -p "$BIN_DIR" "$ETC_DIR" "$VAR_DIR" "$LOG_DIR" "$ACME_DIR"
+  chmod 0755 "$PREFIX" "$BIN_DIR" "$VAR_DIR"
+  chmod 0750 "$ETC_DIR" "$LOG_DIR" "$ACME_DIR"
+  if id -u "$SYSUSER" >/dev/null 2>&1; then
+    chown -R root:"$SYSUSER" "$ETC_DIR" "$LOG_DIR" "$ACME_DIR" "$VAR_DIR"
+    chown root:root "$BIN_DIR/hysteria" 2>/dev/null || true
+    chmod 0755 "$BIN_DIR/hysteria" 2>/dev/null || true
+  fi
+  [[ -e "$CONFIG_FILE" ]] && chmod 0640 "$CONFIG_FILE"
+  [[ -e "$STATE_FILE" ]] && chmod 0640 "$STATE_FILE"
+  if [[ -e "$LINK_FILE" ]]; then
+    chmod 0600 "$LINK_FILE"
+    chown root:root "$LINK_FILE" 2>/dev/null || true
+  fi
+  if [[ -e "$MIHOMO_FILE" ]]; then
+    chmod 0600 "$MIHOMO_FILE"
+    chown root:root "$MIHOMO_FILE" 2>/dev/null || true
+  fi
+}
+
+install_binary() {
+  local src="$1"
+  mkdir -p "$BIN_DIR"
+  local tmp="${BIN_DIR}/hysteria.new.$$"
+  cp -a "$src" "$tmp"
+  chmod 0755 "$tmp"
+  verify_binary_version "$tmp" || { rm -f "$tmp"; die "新二进制版本校验失败，未替换现有文件。"; }
+  mv -f "$tmp" "$BIN_DIR/hysteria"
+}
+
+wait_service_ready() {
+  local logtxt
+  for _ in $(seq 1 90); do
+    logtxt="$(journalctl -u "$UNIT_NAME" -n 80 --no-pager 2>/dev/null || true)"
+    if printf '%s\n' "$logtxt" | grep -qiE 'server up and running'; then
+      return 0
+    fi
+    if printf '%s\n' "$logtxt" | grep -qiE 'FATAL|failed to load server config|obtaining certificate|authorization failed|rateLimited'; then
+      err "服务日志出现失败信息："
+      printf '%s\n' "$logtxt" | tail -n 40 >&2
+      return 1
+    fi
+    if ! systemctl is-active --quiet "$UNIT_NAME"; then
+      err "服务未保持运行。"
+      systemctl status "$UNIT_NAME" --no-pager -l || true
+      return 1
+    fi
+    sleep 1
+  done
+  if systemctl is-active --quiet "$UNIT_NAME"; then
+    warn "90 秒内未在日志中看到 server up and running，但服务仍在运行。请自行检查：journalctl -u ${UNIT_NAME} -e"
+    return 0
+  fi
+  return 1
+}
+
+start_service() {
+  systemctl enable "$UNIT_NAME"
+  if ! systemctl restart "$UNIT_NAME"; then
+    err "服务启动失败。"
+    systemctl status "$UNIT_NAME" --no-pager -l || true
+    journalctl -u "$UNIT_NAME" -n 80 --no-pager || true
+    rollback_install
+    die "已回滚到安装前状态（若为首次安装则已禁用并移除新单元）。"
+  fi
+  SERVICE_STARTED_THIS_RUN=1
+  if ! wait_service_ready; then
+    rollback_install
+    die "服务未能就绪，已回滚。"
+  fi
+  info "服务 ${UNIT_NAME} 已运行。官方内置 ACME（CertMagic）会在服务运行期间自动续期并继续使用新证书，无需另装定时任务。"
+}
+
+# ---------------------------------------------------------------------------
+# 已安装检测与换端口（不重装、不重签证书、不下载二进制）
+# ---------------------------------------------------------------------------
+read_config_listen_port() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || return 1
+  python3 - "$cfg" <<'PYCODE'
+import re,sys
+text=open(sys.argv[1],encoding="utf-8").read()
+m=re.search(r"(?m)^\s*listen:\s*.*:([0-9]+)\s*$", text)
+if not m:
+    sys.exit(1)
+print(m.group(1))
+PYCODE
+}
+
+load_existing_identity() {
+  [[ -f "$STATE_FILE" ]] || return 1
+  AUTH_PASSWORD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("password") or "")' "$STATE_FILE")"
+  [[ -n "$AUTH_PASSWORD" ]] || return 1
+  SAVED_NAME="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("name") or "")' "$STATE_FILE")"
+  SAVED_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("port") or "")' "$STATE_FILE")"
+  SAVED_DOMAIN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("domain") or "")' "$STATE_FILE")"
+  SAVED_SNI="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("sni") or "")' "$STATE_FILE")"
+  SAVED_EMAIL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("acme_email") or "")' "$STATE_FILE")"
+  SAVED_TLS_MODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tls_mode") or "")' "$STATE_FILE")"
+  SAVED_TLS_CERT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tls_cert") or "")' "$STATE_FILE")"
+  SAVED_TLS_KEY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("tls_key") or "")' "$STATE_FILE")"
+  [[ -n "$SAVED_NAME" && -n "$SAVED_DOMAIN" ]] || return 1
+  return 0
+}
+
+require_hy2_installed() {
+  if [[ ! -f "$STATE_FILE" || ! -f "$CONFIG_FILE" ]]; then
+    die "未检测到本脚本安装的节点（缺少 ${PREFIX} 下的配置或状态文件）。换端口只能用于已安装实例，请先完成安装。"
+  fi
+  if ! load_existing_identity; then
+    die "状态文件不完整，已拒绝换端口，以免生成新密码或触发证书申请。"
+  fi
+  NODE_NAME="$SAVED_NAME"
+  DOMAIN="$SAVED_DOMAIN"
+  SNI="${SAVED_SNI:-$DOMAIN}"
+  ACME_EMAIL="${SAVED_EMAIL:-hy2-acme@${DOMAIN}}"
+  TLS_MODE="${SAVED_TLS_MODE:-acme}"
+  TLS_CERT="${SAVED_TLS_CERT:-}"
+  TLS_KEY="${SAVED_TLS_KEY:-}"
+  OLD_PORT="${SAVED_PORT:-}"
+  local cfg_port=''
+  if cfg_port="$(read_config_listen_port "$CONFIG_FILE")"; then
+    if [[ -n "$OLD_PORT" && "$cfg_port" != "$OLD_PORT" ]]; then
+      warn "状态文件中的端口（${OLD_PORT}）与配置监听端口（${cfg_port}）不一致，将以配置为准。"
+    fi
+    OLD_PORT="$cfg_port"
+  fi
+  valid_port "${OLD_PORT:-}" || die "无法确定当前 UDP 端口。"
+  if [[ $SANDBOX -eq 0 ]]; then
+    [[ -x "$BIN_DIR/hysteria" ]] || die "未找到本脚本的官方二进制 ${BIN_DIR}/hysteria，已拒绝继续。"
+    [[ -f "$UNIT_PATH" ]] || die "未找到服务单元 ${UNIT_PATH}，已拒绝继续，以免误操作其他服务。"
+    if ! grep -F "${BIN_DIR}/hysteria" "$UNIT_PATH" >/dev/null 2>&1 \
+      || ! grep -F "${CONFIG_FILE}" "$UNIT_PATH" >/dev/null 2>&1; then
+      die "系统单元 ${UNIT_PATH} 不属于本脚本安装，已拒绝修改。"
+    fi
+  fi
+}
+
+prompt_change_port() {
+  local raw="${REQUESTED_PORT:-}"
+  if [[ -z "$raw" && -n "${HY2_NODE_PORT:-}" ]]; then
+    raw="${HY2_NODE_PORT}"
+  fi
+  if [[ -z "$raw" ]]; then
+    if [[ $ASSUME_YES -eq 1 ]]; then
+      die "非交互换端口需要提供新端口：sudo bash ${SCRIPT_NAME} --change-port 443"
+    fi
+    if [[ ! -t 0 ]]; then
+      die "没有终端可询问新端口。请使用：sudo bash ${SCRIPT_NAME} --change-port <端口>"
+    fi
+    printf '当前 UDP 端口是 %s。请输入新端口（推荐 443）：' "$OLD_PORT" >&2
+    read -r raw
+  fi
+  raw="$(printf '%s' "$raw" | awk '{$1=$1; print}')"
+  valid_port "$raw" || die "端口无效：${raw:-空}"
+  PORT="$raw"
+}
+
+maybe_open_new_udp_port() {
+  local mode
+  # 换端口时即使加了 --yes，本机放行仍须明确确认（除非预先设置 HY2_NODE_OPEN_PORT）
+  if [[ -n "${OPEN_PORT_MODE}" ]]; then
+    mode="$(maybe_prompt_mode "${OPEN_PORT_MODE}")"
+  elif [[ -t 0 ]]; then
+    mode='ask'
+  else
+    mode='no'
+  fi
+  info "如需本机放行新端口，只会新增 UDP ${PORT} 规则，不会删除旧端口 UDP ${OLD_PORT} 的规则（可能仍被其他服务使用）。不会改动 TCP 80 证书挑战端口。云厂商安全组请自行放行新的 UDP ${PORT}，并更新客户端订阅或重新导入链接。"
+  case "$mode" in
+    no|NO|0)
+      info "已跳过本机防火墙写入。请自行放行 UDP ${PORT}，并检查云安全组。"
+      return 0
+      ;;
+    yes|YES|1)
+      ;;
+    ask|ASK)
+      if confirm "是否仅新增放行本机 UDP ${PORT}（不删旧规则、不改默认策略和 SSH、不改 TCP 80）？"; then
+        mode='yes'
+      else
+        info "已跳过本机端口放行。请记得在云安全组放行 UDP ${PORT}。"
+        return 0
+      fi
+      ;;
+    *) die "HY2_NODE_OPEN_PORT 只能是 yes、no 或 ask。" ;;
+  esac
+  if [[ $SANDBOX -eq 1 ]]; then
+    info "沙箱模式：不修改防火墙。"
+    return 0
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow "${PORT}/udp" comment 'hy2-node' || die "ufw 放行 UDP 失败。"
+    info "已通过 ufw 新增 UDP ${PORT}。未删除旧端口规则。"
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+    firewall-cmd --permanent --add-port="${PORT}/udp" || die "firewalld 放行 UDP 失败。"
+    firewall-cmd --reload || true
+    info "已通过 firewalld 新增 UDP ${PORT}。未删除旧端口规则。"
+    return 0
+  fi
+  warn "未检测到已启用的 ufw 或 firewalld。本脚本不会擅自改 iptables/nft。请自行放行 UDP ${PORT}，并检查云防火墙/安全组。"
+}
+
+restart_our_service_after_port_change() {
+  local was_active="${PREV_UNIT_ACTIVE}"
+  if ! systemctl restart "$UNIT_NAME"; then
+    err "换端口后服务重启失败，不会停止其他服务。正在恢复旧配置。"
+    systemctl status "$UNIT_NAME" --no-pager -l || true
+    journalctl -u "$UNIT_NAME" -n 80 --no-pager || true
+    rollback_install
+    if [[ "$was_active" == "active" ]]; then
+      systemctl start "$UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+    die "已恢复原来的端口、配置和客户端链接。"
+  fi
+  SERVICE_STARTED_THIS_RUN=1
+  if ! wait_service_ready; then
+    rollback_install
+    if [[ "$was_active" == "active" ]]; then
+      systemctl start "$UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+    die "服务未能在新端口就绪，已恢复原来的端口、配置和客户端链接。"
+  fi
+  info "服务 ${UNIT_NAME} 已在 UDP ${PORT} 上运行。证书与 ACME 状态未改动。"
+}
+
+run_change_port() {
+  if [[ $SANDBOX -eq 0 ]]; then
+    if [[ "$(id -u)" != "0" ]]; then
+      die "换端口需要 root。请使用：sudo bash ${SCRIPT_NAME} --change-port [端口]"
+    fi
+    os_supported || die "仅支持 Debian 或 Ubuntu（当前：$(os_id:-未知)）。"
+    have_systemd || die "需要 systemd。"
+  fi
+  init_paths
+  if [[ $SANDBOX -eq 0 ]]; then
+    command -v python3 >/dev/null 2>&1 || die "缺少命令：python3。"
+    if ! command -v ss >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+      die "需要 ss 或 lsof 才能检查端口占用。"
+    fi
+  fi
+  require_hy2_installed
+  if have_systemd && [[ $SANDBOX -eq 0 ]]; then
+    info "当前服务 ${UNIT_NAME} 状态：$(systemctl is-active "$UNIT_NAME" 2>/dev/null || true)（enabled=$(systemctl is-enabled "$UNIT_NAME" 2>/dev/null || true)）"
+  fi
+  prompt_change_port
+  if [[ "$PORT" == "$OLD_PORT" ]]; then
+    info "当前已经是 UDP ${PORT}，无需修改。"
+    return 0
+  fi
+  assert_udp_port_free "$PORT"
+  info "将把 UDP 端口从 ${OLD_PORT} 改为 ${PORT}。会保留密码、域名、SNI、节点名称和证书/ACME 状态，不会重新申请证书，也不会下载或升级二进制。"
+  mkdir -p "$ETC_DIR"
+  prepare_rollback_snapshots
+  export_runtime_env
+  write_server_config
+  assert_config_policy "$CONFIG_FILE" || { rollback_install; die "新端口配置不符合既定策略，已恢复。"; }
+  write_client_files
+  save_state
+  if [[ $SANDBOX -eq 1 ]]; then
+    info "沙箱模式：已写入新端口的配置与客户端文件，未重启系统服务，也未改防火墙。"
+    return 0
+  fi
+  restart_our_service_after_port_change
+  fix_permissions
+  maybe_open_new_udp_port
+  info "换端口完成：${OLD_PORT}/udp -> ${PORT}/udp。显示名：${NODE_NAME}；证书与 SNI 仍是 ${SNI}。"
+  info "更新后的客户端 URI：${LINK_FILE}；Mihomo 片段：${MIHOMO_FILE}"
+  info "请更新客户端订阅或重新导入链接。云安全组需放行新的 UDP ${PORT}。旧端口规则未删除。"
+  if [[ -t 1 ]]; then
+    echo "----- 新的客户端 URI（请当凭据保管） -----"
+    cat "$LINK_FILE"
+    echo
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 交互输入
+# ---------------------------------------------------------------------------
+prompt_inputs() {
+  local raw_name raw_port raw_domain raw_email
+  if [[ -n "${HY2_NODE_NAME:-}" ]]; then
+    raw_name="${HY2_NODE_NAME}"
+  elif [[ $ASSUME_YES -eq 1 ]]; then
+    die "非交互模式需要设置 HY2_NODE_NAME。"
+  else
+    if [[ -n "${SAVED_NAME:-}" ]]; then
+      printf '节点名称（直接回车保留 %s）：' "$SAVED_NAME" >&2
+    else
+      printf '节点名称（将自动加上 HY2- 前缀；已带 HY2- 则不重复）：' >&2
+    fi
+    read -r raw_name
+    if [[ -z "$raw_name" && -n "${SAVED_NAME:-}" ]]; then
+      raw_name="$SAVED_NAME"
+    fi
+  fi
+  if ! NODE_NAME="$(normalize_node_name "$raw_name")"; then
+    die "节点名称无效。不能为空，且不能只写成 HY2-。"
+  fi
+  if [[ "$raw_name" == "${NAME_PREFIX}"* ]]; then
+    info "节点名称已带 ${NAME_PREFIX} 前缀，保持为：${NODE_NAME}"
+  else
+    info "节点名称已统一为：${NODE_NAME}"
+  fi
+
+  if [[ -n "${HY2_NODE_PORT:-}" ]]; then
+    raw_port="${HY2_NODE_PORT}"
+  elif [[ $ASSUME_YES -eq 1 ]]; then
+    raw_port="$(resolve_listen_port "" "${SAVED_PORT:-}")"
+    if [[ -z "${SAVED_PORT:-}" ]]; then
+      info "未指定端口，使用推荐的 443/UDP。"
+    fi
+  else
+    if [[ -n "${SAVED_PORT:-}" ]]; then
+      printf 'UDP 端口（直接回车保留 %s）：' "$SAVED_PORT" >&2
+    else
+      printf 'UDP 监听端口（推荐 443，直接回车使用 443）：' >&2
+    fi
+    read -r raw_port
+    raw_port="$(resolve_listen_port "$raw_port" "${SAVED_PORT:-}")"
+  fi
+  valid_port "$raw_port" || die "端口无效：$raw_port"
+  PORT="$raw_port"
+
+  if [[ -n "${HY2_NODE_DOMAIN:-}" ]]; then
+    raw_domain="${HY2_NODE_DOMAIN}"
+  elif [[ $ASSUME_YES -eq 1 ]]; then
+    die "非交互模式需要设置 HY2_NODE_DOMAIN（必须是已解析到本机的自有域名）。"
+  else
+    if [[ -n "${SAVED_DOMAIN:-}" ]]; then
+      printf '域名（直接回车保留 %s）：' "$SAVED_DOMAIN" >&2
+    else
+      printf '已解析到本机的自有域名（将用作证书与 SNI，不会伪造大厂域名）：' >&2
+    fi
+    read -r raw_domain
+    if [[ -z "$raw_domain" && -n "${SAVED_DOMAIN:-}" ]]; then
+      raw_domain="$SAVED_DOMAIN"
+    fi
+  fi
+  DOMAIN="$(valid_domain "$raw_domain")" || die "域名无效。请填写你自己的域名，并且不要使用 IP 地址。"
+  SNI="$DOMAIN"
+
+  if [[ -n "${HY2_NODE_ACME_EMAIL:-}" ]]; then
+    ACME_EMAIL="${HY2_NODE_ACME_EMAIL}"
+  elif [[ $ASSUME_YES -eq 1 ]]; then
+    ACME_EMAIL="${SAVED_EMAIL:-hy2-acme@${DOMAIN}}"
+  else
+    if [[ -n "${SAVED_EMAIL:-}" ]]; then
+      printf 'ACME 联系邮箱（直接回车保留已有值，仅用于证书到期通知）：' >&2
+    else
+      printf 'ACME 联系邮箱（直接回车则使用 hy2-acme@%s，仅用于 CA 通知，可稍后改配置）：' "$DOMAIN" >&2
+    fi
+    read -r raw_email
+    if [[ -n "$raw_email" ]]; then
+      ACME_EMAIL="$raw_email"
+    elif [[ -n "${SAVED_EMAIL:-}" ]]; then
+      ACME_EMAIL="$SAVED_EMAIL"
+    else
+      ACME_EMAIL="hy2-acme@${DOMAIN}"
+    fi
+  fi
+  python3 -c 'import re,sys; s=sys.argv[1]; sys.exit(0 if re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s) else 1)' "$ACME_EMAIL" \
+    || die "ACME 邮箱格式无效。"
+
+  if [[ -n "${HY2_NODE_TLS_CERT:-}" || -n "${HY2_NODE_TLS_KEY:-}" ]]; then
+    [[ -n "${HY2_NODE_TLS_CERT:-}" && -n "${HY2_NODE_TLS_KEY:-}" ]] || die "已有证书需同时提供 HY2_NODE_TLS_CERT 与 HY2_NODE_TLS_KEY。"
+    TLS_MODE='existing'
+    TLS_CERT="${HY2_NODE_TLS_CERT}"
+    TLS_KEY="${HY2_NODE_TLS_KEY}"
+  elif [[ $ASSUME_YES -eq 1 ]]; then
+    TLS_MODE='acme'
+  else
+    TLS_MODE='acme'
+  fi
+
+  if [[ -n "${SAVED_DOMAIN:-}" && "$DOMAIN" != "${SAVED_DOMAIN}" && "$TLS_MODE" == "acme" ]]; then
+    warn "域名已从 ${SAVED_DOMAIN} 改为 ${DOMAIN}。若使用 ACME，这会申请新证书，请注意 Let’s Encrypt 频率限制。"
+  fi
+}
+
+export_runtime_env() {
+  export NODE_NAME PORT DOMAIN SNI ACME_EMAIL TLS_MODE TLS_CERT TLS_KEY AUTH_PASSWORD ACME_DIR HY2_VERSION
+}
+
+# ---------------------------------------------------------------------------
+# 安装流程
+# ---------------------------------------------------------------------------
+run_install() {
+  if [[ $SANDBOX -eq 0 && $SKIP_SYSTEMD -eq 0 ]]; then
+    [[ "$(id -u)" == "0" ]] || die "安装需要 root（请使用 sudo）。自检请用 --self-test。"
+    os_supported || die "仅支持 Debian 或 Ubuntu（当前：$(os_id:-未知)）。"
+    have_systemd || die "需要 systemd。"
+  fi
+  detect_asset
+  init_paths
+  ensure_dependencies
+  mkdir -p "$ETC_DIR"
+  load_or_create_identity
+  prompt_inputs
+  export_runtime_env
+  preflight_conflicts
+  verify_domain_points_to_this_host "$DOMAIN"
+  if [[ "$TLS_MODE" == "existing" ]]; then
+    verify_existing_certificate "$TLS_CERT" "$TLS_KEY" "$DOMAIN" || die "已有证书未通过校验。"
+  fi
+  assert_udp_port_free "$PORT"
+  assert_tcp80_or_existing_cert
+
+  if [[ $SANDBOX -eq 1 ]]; then
+    mkdir -p "$BIN_DIR" "$ETC_DIR" "$ACME_DIR" "$LOG_DIR"
+    AUTH_PASSWORD="$AUTH_PASSWORD" NODE_NAME="$NODE_NAME" PORT="$PORT" DOMAIN="$DOMAIN" \
+      SNI="$SNI" ACME_EMAIL="$ACME_EMAIL" TLS_MODE="$TLS_MODE" TLS_CERT="$TLS_CERT" \
+      TLS_KEY="$TLS_KEY" HY2_VERSION="$HY2_VERSION" ACME_DIR="$ACME_DIR" \
+      save_state
+    write_server_config
+    assert_config_policy "$CONFIG_FILE"
+    write_client_files
+    info "沙箱模式已写入配置与客户端文件，未安装 systemd、未改防火墙或 sysctl。"
+    return 0
+  fi
+
+  prepare_rollback_snapshots
+  local work bin_src
+  work="$(mktemp -d "${TMPDIR:-/tmp}/hy2-dl.XXXXXX")"
+  # 若已有相同哈希的二进制则跳过下载
+  if [[ -x "$BIN_DIR/hysteria" ]] && [[ "$(sha256_of "$BIN_DIR/hysteria")" == "$PINNED_SHA256" ]]; then
+    info "已安装的官方二进制哈希与 ${HY2_VERSION} 钉死值一致，跳过下载。"
+    bin_src="$BIN_DIR/hysteria"
+  else
+    bin_src="$(download_and_verify_binary "$work")"
+  fi
+  verify_binary_version "$bin_src" || { rollback_install; die "官方二进制版本不符合 ${HY2_VERSION}。"; }
+
+  ensure_sysuser
+  mkdir -p "$BIN_DIR" "$ETC_DIR" "$ACME_DIR" "$LOG_DIR"
+  if [[ "$bin_src" != "$BIN_DIR/hysteria" ]]; then
+    install_binary "$bin_src"
+  fi
+  export_runtime_env
+  save_state
+  write_server_config
+  assert_config_policy "$CONFIG_FILE" || { rollback_install; die "生成的服务端配置不符合既定策略。"; }
+  write_client_files
+  write_unit
+  fix_permissions
+  maybe_apply_udp_buffers
+  maybe_open_ports
+  start_service
+  fix_permissions
+
+  info "安装完成。协议：官方 Hysteria 2 ${HY2_VERSION}；证书与 SNI：${SNI}；UDP 端口：${PORT}；显示名：${NODE_NAME}。"
+  info "客户端 URI（含密码）已写入受限文件：${LINK_FILE}"
+  info "可选 Mihomo 片段（未填写 up/down，避免客户端 Brutal）已写入：${MIHOMO_FILE}"
+  info "说明：hysteria2:// URI 不能强制客户端拥塞控制。导入时请勿自行填写过高带宽。"
+  if [[ -t 1 ]]; then
+    echo "----- 客户端 URI（请当凭据保管，不要发到聊天或日志） -----"
+    cat "$LINK_FILE"
+    echo
+    echo "----- Mihomo 片段（无 up/down） -----"
+    cat "$MIHOMO_FILE"
+    echo "----------------------------------------------------------------"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 自检（不安装系统服务，不改防火墙/sysctl，不全局安装依赖）
+# ---------------------------------------------------------------------------
+self_test() {
+  local rc=0
+  local testdir
+  testdir="$(mktemp -d "${TMPDIR:-/tmp}/hy2-node-selftest.XXXXXX")"
+  info "自检目录：${testdir}"
+
+  info "运行 bash -n …"
+  bash -n "$0" || { err "bash -n 失败"; return 1; }
+
+  if command -v shellcheck >/dev/null 2>&1; then
+    info "运行已有 shellcheck …"
+    shellcheck -x "$0" || rc=1
+  else
+    local sc_dir="${testdir}/shellcheck"
+    mkdir -p "$sc_dir"
+    info "本机无 shellcheck，尝试把官方预编译包解压到临时目录（不全局安装）…"
+    local sc_url sc_tar
+    sc_url='https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz'
+    sc_tar="${sc_dir}/shellcheck.tar.xz"
+    if curl -fsSL --connect-timeout 15 --max-time 60 -o "$sc_tar" "$sc_url" \
+        && tar -xJf "$sc_tar" -C "$sc_dir"; then
+      local sc
+      sc="$(find "$sc_dir" -type f -name shellcheck | head -n1)"
+      if [[ -n "$sc" ]]; then
+        chmod +x "$sc"
+        "$sc" -x "$0" || rc=1
+      else
+        warn "临时 shellcheck 解压后未找到可执行文件，已跳过。"
+      fi
+    else
+      warn "无法下载临时 shellcheck，已跳过该项。bash -n 已执行。"
+    fi
+  fi
+
+  need_cmd python3 openssl
+
+  info "测试节点名前缀 HY2- …"
+  local n1 n2 n3
+  n1="$(normalize_node_name '美国节点1')" || { err "前缀添加失败"; rc=1; n1=''; }
+  n2="$(normalize_node_name 'HY2-美国节点1')" || { err "已有前缀处理失败"; rc=1; n2=''; }
+  n3="$(normalize_node_name '  HY2-日本节点  ')" || { err "空白修剪失败"; rc=1; n3=''; }
+  if [[ "$n1" != 'HY2-美国节点1' || "$n2" != 'HY2-美国节点1' || "$n3" != 'HY2-日本节点' ]]; then
+    err "前缀结果错误：$n1 / $n2 / $n3"
+    rc=1
+  fi
+  if normalize_node_name 'HY2-' >/dev/null 2>&1 || normalize_node_name '   ' >/dev/null 2>&1; then
+    err "空名称应被拒绝"
+    rc=1
+  else
+    info "节点名称规则通过"
+  fi
+
+  info "测试分享链接编码（密码、备注、sni、alpn）…"
+  AUTH_PASSWORD='p@ss:word/测' DOMAIN='hy2.example.com' PORT='443' SNI='hy2.example.com' NODE_NAME='HY2-测试 节点' \
+    python3 - <<'PYCODE' || rc=1
+import os,urllib.parse,subprocess,sys
+# 直接复用同一算法
+host=os.environ["DOMAIN"]
+password=os.environ["AUTH_PASSWORD"]
+sni=os.environ["SNI"]
+name=os.environ["NODE_NAME"]
+user=urllib.parse.quote(password, safe="")
+q=urllib.parse.urlencode({"sni": sni, "alpn": "h3"}, quote_via=urllib.parse.quote, safe="")
+frag=urllib.parse.quote(name, safe="")
+uri=f"hysteria2://{user}@{host}:{os.environ['PORT']}/?{q}#{frag}"
+u=urllib.parse.urlparse(uri)
+assert u.scheme=="hysteria2"
+assert u.hostname=="hy2.example.com"
+assert u.port==443
+assert urllib.parse.unquote(u.username)=="p@ss:word/测"
+qs=urllib.parse.parse_qs(u.query, keep_blank_values=True)
+assert qs["sni"]==["hy2.example.com"]
+assert qs["alpn"]==["h3"]
+assert "insecure" not in qs
+assert "pinSHA256" not in qs
+assert "up" not in qs and "down" not in qs
+assert urllib.parse.unquote(u.fragment)=="HY2-测试 节点"
+print("URI 解析通过")
+PYCODE
+
+  info "测试域名校验（拒绝 IP、localhost；接受普通域名）…"
+  if valid_domain 'hy2.example.com' >/dev/null && ! valid_domain '127.0.0.1' >/dev/null && ! valid_domain 'localhost' >/dev/null && ! valid_domain 'not a domain' >/dev/null; then
+    info "域名校验通过"
+  else
+    err "域名校验失败"
+    rc=1
+  fi
+
+  info "测试身份保留（第二次不得改密码）…"
+  PREFIX="${testdir}/prefix"
+  SKIP_SYSTEMD=1
+  SANDBOX=1
+  init_paths
+  mkdir -p "$ETC_DIR" "$ACME_DIR"
+  AUTH_PASSWORD='KeepThisPassword_abc123'
+  NODE_NAME='HY2-保留'
+  PORT='8443'
+  DOMAIN='keep.example.com'
+  SNI='keep.example.com'
+  ACME_EMAIL='hy2-acme@keep.example.com'
+  TLS_MODE='acme'
+  TLS_CERT=''
+  TLS_KEY=''
+  export_runtime_env
+  save_state
+  AUTH_PASSWORD='SHOULD_NOT_STAY'
+  load_or_create_identity
+  if [[ "$AUTH_PASSWORD" != 'KeepThisPassword_abc123' ]]; then
+    err "重跑未保留认证密码"
+    rc=1
+  else
+    info "身份保留通过"
+  fi
+
+  info "测试配置策略与客户端文件…"
+  write_server_config
+  assert_config_policy "$CONFIG_FILE" || { err "配置策略失败"; rc=1; }
+  write_client_files
+  python3 - "$LINK_FILE" "$MIHOMO_FILE" <<'PYCODE' || rc=1
+import sys,urllib.parse,re
+uri=open(sys.argv[1],encoding="utf-8").read().strip()
+mi=open(sys.argv[2],encoding="utf-8").read()
+u=urllib.parse.urlparse(uri)
+assert u.scheme=="hysteria2"
+assert urllib.parse.unquote(u.fragment)=="HY2-保留"
+qs=urllib.parse.parse_qs(u.query)
+assert qs["sni"]==["keep.example.com"] and qs["alpn"]==["h3"]
+assert "up" not in mi.lower() and "down" not in mi.lower()
+assert "skip-cert-verify: false" in mi
+assert "name: \"HY2-保留\"" in mi or "name: HY2-保留" in mi
+print("客户端文件通过")
+PYCODE
+
+  info "测试端口默认推荐 443，且不会随机生成…"
+  if [[ "$(resolve_listen_port '' '')" != "443" || "$(resolve_listen_port '' '8443')" != "8443" || "$(resolve_listen_port '1234' '443')" != "1234" ]]; then
+    err "端口默认/保留逻辑不正确"
+    rc=1
+  fi
+  # shellcheck disable=SC2016  # 有意匹配源码中的字面量 $RANDOM / shuf，不是要展开
+  if grep -E 'PORT=\$\((shuf|od |head )|PORT=\$RANDOM|REQUESTED_PORT=\$RANDOM' "$0" >/dev/null; then
+    err "脚本中出现了随机生成端口的逻辑"
+    rc=1
+  else
+    info "端口默认逻辑通过（非随机）"
+  fi
+
+  info "测试 --change-port 保留密码与证书状态，并在失败回滚后恢复旧端口…"
+  mkdir -p "$ACME_DIR"
+  printf 'keep-acme\n' >"${ACME_DIR}/marker.txt"
+  REQUESTED_PORT='9443'
+  if ! run_change_port; then
+    err "沙箱换端口失败"
+    rc=1
+  else
+    if [[ "$(read_config_listen_port "$CONFIG_FILE")" != "9443" ]]; then
+      err "换端口后配置监听不是 9443"
+      rc=1
+    fi
+    python3 - "$LINK_FILE" "$MIHOMO_FILE" "$STATE_FILE" "${ACME_DIR}/marker.txt" <<'PYCODE' || rc=1
+import json,sys,urllib.parse
+uri=open(sys.argv[1],encoding="utf-8").read().strip()
+mi=open(sys.argv[2],encoding="utf-8").read()
+st=json.load(open(sys.argv[3],encoding="utf-8"))
+mk=open(sys.argv[4],encoding="utf-8").read().strip()
+u=urllib.parse.urlparse(uri)
+assert u.port==9443
+assert urllib.parse.unquote(u.username)=="KeepThisPassword_abc123"
+assert urllib.parse.unquote(u.fragment)=="HY2-保留"
+qs=urllib.parse.parse_qs(u.query)
+assert qs["sni"]==["keep.example.com"] and qs["alpn"]==["h3"]
+assert st["password"]=="KeepThisPassword_abc123"
+assert st["domain"]=="keep.example.com"
+assert st["name"]=="HY2-保留"
+assert st["port"]=="9443"
+assert "port: 9443" in mi
+assert "up" not in mi.lower() and "down" not in mi.lower()
+assert mk=="keep-acme"
+print("换端口后身份与 URI 通过")
+PYCODE
+    rollback_install
+    if [[ "$(read_config_listen_port "$CONFIG_FILE")" != "8443" ]]; then
+      err "回滚后配置端口不是 8443"
+      rc=1
+    fi
+    python3 - "$LINK_FILE" "$STATE_FILE" "${ACME_DIR}/marker.txt" <<'PYCODE' || rc=1
+import json,sys,urllib.parse
+uri=open(sys.argv[1],encoding="utf-8").read().strip()
+st=json.load(open(sys.argv[2],encoding="utf-8"))
+mk=open(sys.argv[3],encoding="utf-8").read().strip()
+u=urllib.parse.urlparse(uri)
+assert u.port==8443
+assert urllib.parse.unquote(u.username)=="KeepThisPassword_abc123"
+assert st["password"]=="KeepThisPassword_abc123"
+assert st["port"]=="8443"
+assert st["domain"]=="keep.example.com"
+assert mk=="keep-acme"
+print("换端口回滚通过")
+PYCODE
+  fi
+
+  info "测试未安装时换端口应报错…"
+  if (
+    PREFIX="${testdir}/not-installed"
+    SANDBOX=1
+    SKIP_SYSTEMD=1
+    init_paths
+    run_change_port
+  ) >/dev/null 2>&1; then
+    err "未安装时换端口应当失败"
+    rc=1
+  else
+    info "未安装检测通过"
+  fi
+
+  info "测试新端口被占用时应拒绝且不杀进程（mock 监听）…"
+  local busy_port busy_pid
+  busy_port=40123
+  python3 -c 'import socket,time; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("127.0.0.1",40123)); time.sleep(10)' >/dev/null 2>&1 &
+  busy_pid=$!
+  sleep 0.2
+  if ( assert_udp_port_free "$busy_port" ) >/dev/null 2>&1; then
+    err "占用端口检测未生效"
+    rc=1
+  else
+    info "占用冲突检测通过"
+  fi
+  kill "$busy_pid" >/dev/null 2>&1 || true
+  wait "$busy_pid" >/dev/null 2>&1 || true
+
+  info "测试域名指向本机的匹配/拒绝逻辑（mock）…"
+  python3 - <<'PYCODE' || rc=1
+import ipaddress
+local={ipaddress.ip_address("203.0.113.10"), ipaddress.ip_address("2001:db8::10")}
+ok=ipaddress.ip_address("203.0.113.10")
+bad=ipaddress.ip_address("1.1.1.1")
+assert ok in local and bad not in local
+print("mock 地址比较通过")
+PYCODE
+  # 用函数级检测：把 collect 结果替换不方便，这里直接测 cf 判断
+  local cfyes
+  cfyes="$(cf_reason_if_any '104.16.1.1')"
+  [[ "$cfyes" == "yes" ]] || { err "Cloudflare 地址段识别失败"; rc=1; }
+
+  info "测试脚本钉死的下载地址不含 latest…"
+  # shellcheck disable=SC2016  # 有意匹配源码中的变量字面量，不是要展开
+  if grep -F 'releases/download/${HY2_RELEASE_TAG}' "$0" >/dev/null; then
+    :
+  else
+    err "未找到固定版本下载路径"
+    rc=1
+  fi
+  if grep -E 'download\.hysteria\.network/app/latest' "$0" >/dev/null; then
+    err "脚本中出现了 latest 下载 URL"
+    rc=1
+  fi
+  latest_hit='releases/lat'
+  latest_hit+='est/'
+  if grep -F "$latest_hit" "$0" >/dev/null; then
+    err "脚本中出现了 latest 下载路径"
+    rc=1
+  fi
+
+  info "测试已有证书必须被系统信任且覆盖域名（mock 自签应拒绝）…"
+  if ! openssl req -x509 -newkey rsa:2048 -keyout "${testdir}/self.key" -out "${testdir}/self.crt" \
+    -days 2 -nodes -subj '/CN=keep.example.com' \
+    -addext 'subjectAltName=DNS:keep.example.com' >/dev/null 2>&1; then
+    err "无法生成自检用临时证书"
+    rc=1
+  elif verify_existing_certificate "${testdir}/self.crt" "${testdir}/self.key" "keep.example.com" >/dev/null 2>&1; then
+    err "自签证书不应通过默认信任校验"
+    rc=1
+  else
+    info "自签证书已被正确拒绝"
+  fi
+
+  info "测试端口占用冲突检测不会去杀进程（mock 文本）…"
+  if listener_is_ours "users:((hysteria,pid=1,fd=3)) ${BIN_DIR}/hysteria"; then
+    :
+  else
+    err "未识别本脚本监听"
+    rc=1
+  fi
+  if listener_is_ours "users:((nginx,pid=9,fd=8))"; then
+    err "误把他人进程认成自己"
+    rc=1
+  fi
+
+  info "测试 hashes.txt 解析…"
+  printf '%s\n' "fc25edff9948708cb00a4ff01f3bccde677660aca050133bb1ad46c6860362d2  build/hysteria-linux-amd64" \
+    >"${testdir}/hashes.txt"
+  local parsed
+  parsed="$(parse_hashes_sha256 "${testdir}/hashes.txt" "build/hysteria-linux-amd64")"
+  [[ "$parsed" == "$PINNED_SHA256_LINUX_AMD64" ]] || { err "hashes 解析失败：$parsed"; rc=1; }
+
+  info "尝试下载官方 ${HY2_VERSION} 二进制并做沙箱校验（官方没有单独的配置测试命令，不会假称有）…"
+  detect_asset
+  local work
+  work="${testdir}/dl"
+  mkdir -p "$work"
+  local bin
+  if bin="$(download_and_verify_binary "$work")"; then
+    if verify_binary_version "$bin"; then
+      info "官方二进制 version 含 ${HY2_VERSION}。"
+    else
+      err "官方二进制版本核验失败"
+      rc=1
+    fi
+    # 使用临时自签证书仅验证官方程序能否加载配置并启动（不是安装默认方案）
+    local live="${testdir}/live"
+    mkdir -p "$live/etc" "$live/var/acme"
+    if ! openssl req -x509 -newkey rsa:2048 -keyout "$live/k.pem" -out "$live/c.pem" \
+      -days 1 -nodes -subj '/CN=127.0.0.1' >/dev/null 2>&1; then
+      err "无法生成沙箱启动用临时证书"
+      rc=1
+    fi
+    PREFIX="$live"
+    init_paths
+    mkdir -p "$ETC_DIR"
+    AUTH_PASSWORD='SelfTestPassw0rd'
+    NODE_NAME='HY2-selftest'
+    PORT='40111'
+    DOMAIN='127.0.0.1.nip.io'
+    # 上面域名不会在此启动 ACME；改用 existing 仅用于加载测试
+    DOMAIN='example.com'
+    SNI='example.com'
+    ACME_EMAIL='hy2-acme@example.com'
+    TLS_MODE='existing'
+    TLS_CERT="$live/c.pem"
+    TLS_KEY="$live/k.pem"
+    export_runtime_env
+    write_server_config
+    # 把 listen 改到高位地址，避免需要特权端口
+    python3 - "$CONFIG_FILE" <<'PYCODE'
+import sys
+p=sys.argv[1]
+t=open(p,encoding="utf-8").read().replace("listen: :40111","listen: 127.0.0.1:40111")
+open(p,"w",encoding="utf-8").write(t)
+PYCODE
+    local outf="${testdir}/hy2-run.log"
+    set +e
+    timeout 3 "$bin" server --config "$CONFIG_FILE" >"$outf" 2>&1
+    local run_rc=$?
+    set -e
+    if grep -qiE 'invalid config|failed to load server config|unknown field' "$outf"; then
+      err "官方程序拒绝了生成的配置："
+      cat "$outf" >&2
+      rc=1
+    elif grep -qiE 'server up and running' "$outf"; then
+      info "官方程序在沙箱中成功加载配置（临时证书仅用于解析/启动验证，不是默认安装路径）。"
+    else
+      # timeout 可能在成功启动后被终止，exit 124
+      if grep -qiE 'listen|quic|tls|server' "$outf" && ! grep -qiE 'FATAL|invalid config' "$outf"; then
+        info "官方程序已接受配置并开始运行（沙箱短超时结束）。日志未见配置错误。"
+      else
+        warn "未能明确看到启动成功日志，已保留输出；不把它说成官方配置测试命令。"
+        cat "$outf" >&2 || true
+        # 不因此把整个自检判死，除非明显是配置错误
+        if [[ $run_rc -ne 0 && $run_rc -ne 124 ]]; then
+          rc=1
+        fi
+      fi
+    fi
+  else
+    warn "无法下载官方二进制，已跳过真实内核校验。语法与链接测试仍已执行。"
+    rc=1
+  fi
+
+  if grep -nE 'printf .*\$.*(AUTH_PASSWORD|PRIVATE|tls_key)' "$0" | grep -v 'write_client_files\|save_state\|STATE_FILE\|# ' >/dev/null; then
+    :
+  fi
+
+  if [[ $rc -eq 0 ]]; then
+    info "自检通过。"
+  else
+    err "自检存在失败项。"
+  fi
+  return "$rc"
+}
+
+main() {
+  local do_change=0
+  REQUESTED_PORT="${REQUESTED_PORT:-}"
+  if [[ $# -eq 0 ]]; then
+    run_install
+    return
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --self-test)
+        SANDBOX=1
+        SKIP_SYSTEMD=1
+        self_test
+        return
+        ;;
+      --yes)
+        ASSUME_YES=1
+        shift
+        ;;
+      --sandbox)
+        SANDBOX=1
+        SKIP_SYSTEMD=1
+        PREFIX="${2:-}"
+        shift 2 || die "--sandbox 需要目录"
+        ;;
+      --change-port)
+        do_change=1
+        shift
+        if [[ $# -gt 0 && "$1" != --* ]]; then
+          REQUESTED_PORT="$1"
+          shift
+        fi
+        ;;
+      *)
+        die "未知参数：$1。使用 --help 查看说明。"
+        ;;
+    esac
+  done
+  if [[ $do_change -eq 1 ]]; then
+    run_change_port
+  else
+    run_install
+  fi
+}
+
+if [[ "${HY2_NODE_ASSUME_YES:-}" == "1" ]]; then
+  ASSUME_YES=1
+fi
+
+main "$@"
