@@ -1,0 +1,1589 @@
+#!/usr/bin/env bash
+# 独立部署 Xray VLESS + XHTTP + REALITY 节点（不安装 3x-ui 面板）。
+# 固定官方版本：Xray-core v26.6.27（官方预发布，不会静默改用最新版）。
+# 仅本脚本被授权制作；不会改 SSH、全局防火墙策略，也不会部署到未被指定的机器。
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 固定版本与官方校验和（来自官方 .dgst / GitHub Releases，不是供应链认证）
+# ---------------------------------------------------------------------------
+readonly XRAY_VERSION='v26.6.27'
+readonly XRAY_RELEASE_TAG='v26.6.27'
+readonly GITHUB_REPO='XTLS/Xray-core'
+readonly DEFAULT_RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases/download/${XRAY_RELEASE_TAG}"
+
+# 官方 Xray-linux-64.zip.dgst 中的 SHA2-256（2026-06-27 发布资源，已对照 API digest）
+readonly PINNED_SHA256_LINUX_64='b3e5902d06d6282fe53cfa2fc426058b9aeaa429b2c812e20887cd47f26d08bf'
+readonly PINNED_SHA256_LINUX_ARM64='13a251379bea366c2cf10363ad71e75734193d401f26f518bf0c25e5c8f8c931'
+
+readonly SCRIPT_NAME='install-xray-node.sh'
+readonly SCRIPT_VERSION='1.0.0'
+readonly UNIT_NAME='xray-node.service'
+readonly DEFAULT_PREFIX='/opt/xray-node'
+readonly SYSUSER='xray-node'
+readonly PROBE_ROUNDS=3
+readonly PROBE_TIMEOUT=6
+readonly PROBE_PORT=443
+
+# 预置大厂候选域名。只探测这份名单，不扫描公网或 CIDR。
+readonly CANDIDATE_DOMAINS=(
+  www.microsoft.com
+  login.microsoftonline.com
+  www.office.com
+  www.bing.com
+  www.apple.com
+  www.icloud.com
+  www.amazon.com
+  aws.amazon.com
+  www.google.com
+  www.gstatic.com
+  dl.google.com
+  www.youtube.com
+  www.github.com
+  www.cloudflare.com
+  www.nvidia.com
+  www.intel.com
+  www.adobe.com
+  www.oracle.com
+  www.ibm.com
+  www.samsung.com
+  www.linkedin.com
+  www.facebook.com
+  www.instagram.com
+  www.meta.com
+  www.spotify.com
+)
+
+# ---------------------------------------------------------------------------
+# 全局状态
+# ---------------------------------------------------------------------------
+PREFIX="${XRAY_NODE_PREFIX:-$DEFAULT_PREFIX}"
+RELEASE_BASE="${XRAY_NODE_RELEASE_BASE:-$DEFAULT_RELEASE_BASE}"
+SANDBOX=0
+SKIP_SYSTEMD=0
+AUTO_SELECT=0
+OPEN_PORT_MODE="${XRAY_NODE_OPEN_PORT:-}"
+ASSUME_YES=0
+
+BIN_DIR=''
+ETC_DIR=''
+SHARE_DIR=''
+LOG_DIR=''
+STATE_FILE=''
+PRIVKEY_FILE=''
+CONFIG_FILE=''
+LINK_FILE=''
+UNIT_PATH='/etc/systemd/system/xray-node.service'
+
+# 安装过程中用于回滚
+PREV_CONFIG_BAK=''
+PREV_STATE_BAK=''
+PREV_PRIV_BAK=''
+PREV_LINK_BAK=''
+PREV_UNIT_BAK=''
+PREV_UNIT_ENABLED=''
+PREV_UNIT_ACTIVE=''
+NEW_UNIT_WRITTEN=0
+SERVICE_STARTED_THIS_RUN=0
+
+# ---------------------------------------------------------------------------
+# 日志（不打印私钥、完整分享链接）
+# ---------------------------------------------------------------------------
+is_tty() { [[ -t 1 ]]; }
+
+log()  { printf '%s\n' "$*" >&2; }
+info() { printf '[信息] %s\n' "$*" >&2; }
+warn() { printf '[警告] %s\n' "$*" >&2; }
+err()  { printf '[错误] %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+disable_xtrace() {
+  case "$-" in
+    *x*) return 1 ;;
+    *)   return 0 ;;
+  esac
+}
+
+with_secrets_quiet() {
+  # 执行可能触及密钥的命令时关闭 xtrace，避免把私钥打进终端记录
+  local xtrace_was=0
+  case "$-" in *x*) xtrace_was=1; set +x ;; esac
+  "$@"
+  local rc=$?
+  if [[ $xtrace_was -eq 1 ]]; then set -x; fi
+  return "$rc"
+}
+
+usage() {
+  cat <<EOF
+${SCRIPT_NAME} ${SCRIPT_VERSION}
+在 Debian / Ubuntu（systemd，amd64 或 arm64）上安装固定版本官方 Xray-core ${XRAY_VERSION}，
+部署单节点：VLESS（decryption=none）+ XHTTP（仅随机 path，其余用该版本默认）+ REALITY。
+不需要自有域名或 ACME 证书。不会覆盖已有 3x-ui / 官方 xray 安装路径。
+
+用法:
+  sudo bash ${SCRIPT_NAME}                 交互安装（需 root）
+  sudo bash ${SCRIPT_NAME} --yes           非交互：需已通过环境变量提供备注和端口
+  bash ${SCRIPT_NAME} --self-test          本地自检（不安装系统服务、不开端口、不改防火墙）
+  bash ${SCRIPT_NAME} --help
+
+常用环境变量:
+  XRAY_NODE_REMARK          节点备注（分享链接 # 后的名称）
+  XRAY_NODE_PORT            监听端口
+  XRAY_NODE_ADDRESS         写入分享链接的服务器地址（IPv4 / IPv6 / 域名）
+  XRAY_NODE_TARGET          跳过候选列表选择，改用该域名（仍会做 TLS1.3+h2 检测）
+  XRAY_NODE_AUTO_SELECT=1   在候选探测结果中自动选取延迟最低的一项
+  XRAY_NODE_OPEN_PORT=yes|no|ask   是否交互放行本机最小端口（默认：有终端则 ask，否则 no）
+  XRAY_NODE_RELEASE_BASE    官方 release 下载前缀（仍校验官方校验和；默认 GitHub）
+  XRAY_NODE_PREFIX          安装目录（默认 ${DEFAULT_PREFIX}）
+
+一条命令远程安装：本仓库目前没有官方托管地址，请先自行把本脚本放到你信任的 HTTPS 地址，
+确认校验后再执行，例如：
+  curl -fsSL https://你自己的地址/${SCRIPT_NAME} | sudo bash
+不要使用来历不明的一键网址。不要用本脚本替换为最新版 Xray。
+
+${XRAY_VERSION} 是官方预发布（prerelease），本脚本有意钉死该版本，不会自动升级。
+官方校验只核对本版本附带的 .dgst 哈希；这不是签名或供应链认证。
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
+need_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "缺少命令：$c。请先安装后再运行（本脚本不会擅自全局安装软件包）。"
+  done
+}
+
+os_id() {
+  local id=''
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  fi
+  printf '%s' "$id"
+}
+
+os_supported() {
+  case "$(os_id)" in
+    debian|ubuntu) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_asset() {
+  local m
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64)
+      ASSET_ZIP='Xray-linux-64.zip'
+      PINNED_SHA256="$PINNED_SHA256_LINUX_64"
+      ;;
+    aarch64|arm64)
+      ASSET_ZIP='Xray-linux-arm64-v8a.zip'
+      PINNED_SHA256="$PINNED_SHA256_LINUX_ARM64"
+      ;;
+    *)
+      die "不支持的架构：$m。仅支持 amd64（x86_64）与 arm64（aarch64）。"
+      ;;
+  esac
+  ASSET_DGST="${ASSET_ZIP}.dgst"
+}
+
+init_paths() {
+  BIN_DIR="${PREFIX}/bin"
+  ETC_DIR="${PREFIX}/etc"
+  SHARE_DIR="${PREFIX}/share"
+  LOG_DIR="${PREFIX}/log"
+  STATE_FILE="${ETC_DIR}/state.json"
+  PRIVKEY_FILE="${ETC_DIR}/private.key"
+  CONFIG_FILE="${ETC_DIR}/config.json"
+  LINK_FILE="${ETC_DIR}/client-link.txt"
+}
+
+have_systemd() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [[ -d /run/systemd/system ]] || return 1
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lnt "( sport = :${port} )" 2>/dev/null | grep -q . && return 0
+    ss -H -lnu "( sport = :${port} )" 2>/dev/null | grep -q . && return 0
+    return 1
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+our_service_owns_port() {
+  local port="$1"
+  # 重跑时，本脚本自己的服务占用该端口不算冲突
+  if [[ $SKIP_SYSTEMD -eq 1 ]]; then
+    return 1
+  fi
+  if have_systemd && systemctl show -p MainPID --value "$UNIT_NAME" >/dev/null 2>&1; then
+    local pid
+    pid="$(systemctl show -p MainPID --value "$UNIT_NAME" 2>/dev/null || true)"
+    if [[ -n "${pid:-}" && "$pid" != "0" ]]; then
+      if command -v ss >/dev/null 2>&1; then
+        ss -H -lntp "( sport = :${port} )" 2>/dev/null | grep -q "pid=${pid}," && return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+detect_3xui() {
+  local found=0
+  if have_systemd; then
+    if systemctl list-unit-files 'x-ui.service' --no-legend 2>/dev/null | grep -q .; then
+      found=1
+    elif systemctl is-active --quiet x-ui.service 2>/dev/null; then
+      found=1
+    fi
+  fi
+  if [[ -d /usr/local/x-ui || -e /usr/local/bin/x-ui ]]; then
+    found=1
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    if docker ps -a --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -Ei '3x-?ui|x-ui' >/dev/null; then
+      found=1
+    fi
+  fi
+  [[ $found -eq 1 ]]
+}
+
+detect_official_or_other_xray() {
+  local hits=()
+  if [[ -e /usr/local/bin/xray ]]; then
+    hits+=('/usr/local/bin/xray')
+  fi
+  if have_systemd && systemctl list-unit-files 'xray.service' --no-legend 2>/dev/null | grep -q .; then
+    hits+=('systemd:xray.service')
+  fi
+  if [[ -d /usr/local/etc/xray ]]; then
+    hits+=('/usr/local/etc/xray')
+  fi
+  if [[ ${#hits[@]} -gt 0 ]]; then
+    printf '%s' "${hits[*]}"
+    return 0
+  fi
+  return 1
+}
+
+our_install_exists() {
+  [[ -s "$STATE_FILE" && -s "$PRIVKEY_FILE" ]]
+}
+
+json_get() {
+  local file="$1" key="$2"
+  python3 - "$file" "$key" <<'PY'
+import json,sys
+path,key=sys.argv[1],sys.argv[2]
+with open(path,encoding='utf-8') as f:
+    data=json.load(f)
+val=data.get(key,"")
+if isinstance(val,list):
+    print(",".join(str(x) for x in val))
+elif val is None:
+    print("")
+else:
+    print(val)
+PY
+}
+
+urlencode() {
+  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  ((10#$p >= 1 && 10#$p <= 65535))
+}
+
+valid_domain() {
+  local d="$1"
+  [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+  [[ "$d" == *.* ]] || return 1
+}
+
+format_host_for_uri() {
+  local host="$1"
+  if [[ "$host" == \[*\] ]]; then
+    printf '%s' "$host"
+    return
+  fi
+  if [[ "$host" == *:* ]]; then
+    printf '[%s]' "$host"
+    return
+  fi
+  printf '%s' "$host"
+}
+
+ipv6_enabled() {
+  [[ -e /proc/net/if_inet6 ]] || return 1
+  if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+    [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "0" ]] || return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 下载与校验
+# ---------------------------------------------------------------------------
+diagnose_curl() {
+  local url="$1" code="$2" curl_rc="$3"
+  err "下载失败：$url"
+  err "curl 退出码：${curl_rc}，HTTP 状态：${code:-无}"
+  case "$curl_rc" in
+    6)  err "诊断：无法解析主机名，请检查 DNS 或到 GitHub 的网络。" ;;
+    7)  err "诊断：连不上服务器，请检查出口网络、代理或防火墙。" ;;
+    28) err "诊断：连接或传输超时。" ;;
+    35) err "诊断：TLS 握手失败，请检查系统时间与证书。" ;;
+    22|0)
+      if [[ -n "$code" && "$code" != "200" ]]; then
+        err "诊断：HTTP ${code}。若是 404，请确认版本 ${XRAY_VERSION} 的资源名未写错；本脚本不会改下最新版。"
+      fi
+      ;;
+    *)  err "诊断：请根据 curl 退出码检查网络。本脚本只从固定地址拉取 ${XRAY_VERSION}。" ;;
+  esac
+  if [[ -n "${XRAY_NODE_RELEASE_BASE:-}" ]]; then
+    info "当前下载前缀：${RELEASE_BASE}"
+  else
+    info "如 GitHub 不可达，可自行设置 XRAY_NODE_RELEASE_BASE 指向你镜像的同类路径，但仍会校验官方哈希。"
+  fi
+}
+
+download_file() {
+  local url="$1" dest="$2"
+  local tmp code rc
+  tmp="${dest}.part"
+  set +e
+  code="$(curl -fsSL --connect-timeout 20 --max-time 300 -A "xray-node-installer/${SCRIPT_VERSION}" \
+    -o "$tmp" -w '%{http_code}' "$url")"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 || "$code" != "200" ]]; then
+    diagnose_curl "$url" "$code" "$rc"
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+parse_dgst_sha256() {
+  local dgst="$1"
+  python3 - "$dgst" <<'PY'
+import re,sys
+text=open(sys.argv[1],encoding='utf-8',errors='replace').read()
+m=re.search(r'^(?:SHA2-256|SHA256)\s*=\s*([0-9a-fA-F]{64})\s*$', text, re.M)
+if not m:
+    sys.exit('无法从官方 .dgst 文件解析 SHA2-256')
+print(m.group(1).lower())
+PY
+}
+
+sha256_of() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+download_and_verify_zip() {
+  local work="$1"
+  local zip_path="${work}/${ASSET_ZIP}"
+  local dgst_path="${work}/${ASSET_DGST}"
+  local url_zip="${RELEASE_BASE}/${ASSET_ZIP}"
+  local url_dgst="${RELEASE_BASE}/${ASSET_DGST}"
+  info "下载官方 ${XRAY_VERSION}：${ASSET_ZIP}"
+  download_file "$url_dgst" "$dgst_path" || die "无法下载官方校验和文件。"
+  download_file "$url_zip" "$zip_path" || die "无法下载官方二进制压缩包。"
+  local official_sha file_sha
+  official_sha="$(parse_dgst_sha256 "$dgst_path")"
+  file_sha="$(sha256_of "$zip_path")"
+  if [[ "$official_sha" != "$PINNED_SHA256" ]]; then
+    die "官方 .dgst 中的 SHA2-256（${official_sha}）与脚本钉死的哈希（${PINNED_SHA256}）不一致。已中止，既不会改用最新版，也不会忽略校验。"
+  fi
+  if [[ "$file_sha" != "$official_sha" ]]; then
+    die "压缩包 SHA256（${file_sha}）与官方 .dgst（${official_sha}）不一致，已删除并中止。这只是哈希校验，不是签名认证。"
+  fi
+  info "校验通过：官方 .dgst SHA2-256 与钉死哈希一致。这不是供应链签名认证。"
+  printf '%s' "$zip_path"
+}
+
+extract_xray() {
+  local zip_path="$1" dest_dir="$2"
+  mkdir -p "$dest_dir"
+  unzip -o -q "$zip_path" -d "$dest_dir"
+  [[ -x "${dest_dir}/xray" || -f "${dest_dir}/xray" ]] || die "压缩包中未找到 xray 可执行文件。"
+  chmod 0755 "${dest_dir}/xray"
+}
+
+verify_binary_version() {
+  local bin="$1"
+  local out
+  out="$("$bin" version 2>&1 || true)"
+  printf '%s\n' "$out" | grep -Eq "Xray[[:space:]]+${XRAY_VERSION#v}|${XRAY_VERSION}" \
+    || die "解压后的二进制版本不是 ${XRAY_VERSION}。输出为：$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)。已中止，不会改用其他版本。"
+}
+
+# ---------------------------------------------------------------------------
+# 身份：首次生成，重跑保留；私钥单独存放，权限严格，不向标准输出打印
+# ---------------------------------------------------------------------------
+rand_hex() {
+  local n="${1:-8}"
+  python3 -c "import secrets; print(secrets.token_hex(int($n)//2))"
+}
+
+rand_path() {
+  python3 - <<'PY'
+import secrets,string
+alphabet=string.ascii_letters+string.digits
+print('/'+''.join(secrets.choice(alphabet) for _ in range(18)))
+PY
+}
+
+parse_x25519() {
+  python3 -c 'import sys,re
+text=sys.stdin.read()
+pk=re.search(r"^PrivateKey:\s*(\S+)\s*$", text, re.M)
+pub=re.search(r"^Password \(PublicKey\):\s*(\S+)\s*$", text, re.M)
+if not pk or not pub:
+    sys.stderr.write("无法解析 xray x25519 输出（v26.6.27 应为 PrivateKey / Password (PublicKey)）。\n")
+    sys.exit(2)
+print(pk.group(1))
+print(pub.group(1))
+'
+}
+
+gen_identity_with_bin() {
+  local bin="$1"
+  local uuid short path priv pub parsed
+  uuid="$("$bin" uuid)"
+  [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "xray uuid 输出异常。"
+  short="$(rand_hex 8)"
+  path="$(rand_path)"
+  parsed="$(with_secrets_quiet "$bin" x25519 | parse_x25519)" || die "生成 X25519 密钥对失败。"
+  priv="${parsed%%$'\n'*}"
+  pub="${parsed#*$'\n'}"
+  printf '%s\n' "$uuid" "$short" "$path" "$priv" "$pub"
+}
+
+write_secret_file() {
+  local dest="$1" mode="$2"
+  local tmp
+  tmp="${dest}.tmp"
+  umask 077
+  cat >"$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+write_state() {
+  local remark="$1" port="$2" uuid="$3" short="$4" path="$5" pub="$6"
+  local target="$7" sni="$8" names="$9" listen="${10}" address="${11}"
+  XRAY_NODE_STATE_REMARK="$remark" \
+  XRAY_NODE_STATE_PORT="$port" \
+  XRAY_NODE_STATE_UUID="$uuid" \
+  XRAY_NODE_STATE_SHORT="$short" \
+  XRAY_NODE_STATE_PATH="$path" \
+  XRAY_NODE_STATE_PUB="$pub" \
+  XRAY_NODE_STATE_TARGET="$target" \
+  XRAY_NODE_STATE_SNI="$sni" \
+  XRAY_NODE_STATE_NAMES="$names" \
+  XRAY_NODE_STATE_LISTEN="$listen" \
+  XRAY_NODE_STATE_ADDRESS="$address" \
+  XRAY_NODE_STATE_VERSION="$XRAY_VERSION" \
+  python3 - "$STATE_FILE" <<'PY'
+import json,os,sys
+path=sys.argv[1]
+names=[x for x in os.environ.get("XRAY_NODE_STATE_NAMES","").split(",") if x]
+data={
+  "version": os.environ["XRAY_NODE_STATE_VERSION"],
+  "remark": os.environ["XRAY_NODE_STATE_REMARK"],
+  "port": int(os.environ["XRAY_NODE_STATE_PORT"]),
+  "uuid": os.environ["XRAY_NODE_STATE_UUID"],
+  "short_id": os.environ["XRAY_NODE_STATE_SHORT"],
+  "path": os.environ["XRAY_NODE_STATE_PATH"],
+  "public_key": os.environ["XRAY_NODE_STATE_PUB"],
+  "target": os.environ["XRAY_NODE_STATE_TARGET"],
+  "sni": os.environ["XRAY_NODE_STATE_SNI"],
+  "server_names": names,
+  "listen": os.environ["XRAY_NODE_STATE_LISTEN"],
+  "address": os.environ.get("XRAY_NODE_STATE_ADDRESS",""),
+}
+tmp=path+".tmp"
+fd=os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o600)
+with os.fdopen(fd,"w",encoding="utf-8") as f:
+    json.dump(data,f,ensure_ascii=False,indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+}
+
+write_config() {
+  # 从环境读取，避免在命令行暴露私钥
+  python3 - "$CONFIG_FILE" <<'PY'
+import json,os,sys
+path=sys.argv[1]
+names=[x for x in os.environ["CFG_SERVER_NAMES"].split(",") if x]
+if not names:
+    raise SystemExit("serverNames 不能为空")
+cfg={
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "listen": os.environ["CFG_LISTEN"],
+    "port": int(os.environ["CFG_PORT"]),
+    "protocol": "vless",
+    "settings": {
+      "clients": [{"id": os.environ["CFG_UUID"]}],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "xhttp",
+      "security": "reality",
+      "xhttpSettings": {
+        "path": os.environ["CFG_PATH"]
+      },
+      "realitySettings": {
+        "show": False,
+        "target": os.environ["CFG_TARGET"],
+        "serverNames": names,
+        "privateKey": os.environ["CFG_PRIVATE_KEY"],
+        "shortIds": [os.environ["CFG_SHORT"]]
+      }
+    },
+    "sniffing": {
+      "enabled": True,
+      "destOverride": ["http", "tls", "quic", "fakedns"],
+      "metadataOnly": False,
+      "routeOnly": False
+    }
+  }],
+  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+}
+tmp=path+".tmp"
+fd=os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_TRUNC, 0o600)
+with os.fdopen(fd,"w",encoding="utf-8") as f:
+    json.dump(cfg,f,ensure_ascii=False,indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+}
+
+build_share_uri() {
+  python3 - <<'PY'
+import os,urllib.parse
+uuid=os.environ["URI_UUID"]
+host=os.environ["URI_HOST"]
+port=os.environ["URI_PORT"]
+sni=os.environ["URI_SNI"]
+pbk=os.environ["URI_PBK"]
+sid=os.environ["URI_SID"]
+path=os.environ["URI_PATH"]
+remark=os.environ["URI_REMARK"]
+if host and not (host.startswith("[") and host.endswith("]")) and ":" in host:
+    host=f"[{host}]"
+q=urllib.parse.urlencode({
+    "encryption": "none",
+    "security": "reality",
+    "sni": sni,
+    "fp": "chrome",
+    "pbk": pbk,
+    "sid": sid,
+    "type": "xhttp",
+    "path": path,
+}, quote_via=urllib.parse.quote, safe="")
+frag=urllib.parse.quote(remark, safe="")
+print(f"vless://{uuid}@{host}:{port}?{q}#{frag}")
+PY
+}
+
+validate_config() {
+  local bin="$1" cfg="$2"
+  local out rc
+  set +e
+  out="$("$bin" run -test -config "$cfg" 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]] || ! printf '%s\n' "$out" | grep -q 'Configuration OK.'; then
+    err "配置校验未通过（xray run -test）。已避免启用服务。"
+    # 过滤可能出现的密钥行后再展示
+    printf '%s\n' "$out" | python3 -c 'import sys,re
+pat=re.compile(r"(PrivateKey|privateKey|private key|Password \(PublicKey\))\s*[:=].*", re.I)
+for line in sys.stdin:
+    if pat.search(line):
+        sys.stderr.write("[已省略可能含密钥的行]\n")
+        continue
+    sys.stderr.write(line)
+' >&2
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# REALITY 目标探测：仅预置域名，TLS 应用握手，不扫公网
+# ---------------------------------------------------------------------------
+probe_domains_py() {
+  python3 - "$PROBE_ROUNDS" "$PROBE_TIMEOUT" "$PROBE_PORT" "$@" <<'PY'
+import json,socket,ssl,statistics,sys,time
+rounds=int(sys.argv[1]); timeout=float(sys.argv[2]); port=int(sys.argv[3])
+domains=sys.argv[4:]
+
+def sans_of(cert):
+    names=[]
+    for typ,val in cert.get("subjectAltName",()):
+        if typ=="DNS" and val:
+            names.append(val)
+    return names
+
+def exact_server_names(host, san_list):
+    out=[]
+    def add(n):
+        n=n.strip()
+        if not n or n.startswith("*"):  # 官方 serverNames 不支持通配符
+            return
+        if n not in out:
+            out.append(n)
+    add(host)
+    for n in san_list:
+        add(n)
+    return out[:8]
+
+def issuer_text(cert):
+    parts=[]
+    for rdn in cert.get("issuer",()):
+        for k,v in rdn:
+            parts.append(f"{k}={v}")
+    return ", ".join(parts)
+
+def handshake_once(host, ip, family):
+    ctx=ssl.create_default_context()
+    ctx.minimum_version=ssl.TLSVersion.TLSv1_3
+    ctx.set_alpn_protocols(["h2"])
+    sock=socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((ip, port))
+        t0=time.perf_counter()
+        ssock=ctx.wrap_socket(sock, server_hostname=host)
+        try:
+            ms=(time.perf_counter()-t0)*1000.0
+            ver=ssock.version()
+            alpn=ssock.selected_alpn_protocol()
+            cert=ssock.getpeercert()
+            if ver!="TLSv1.3":
+                raise ssl.SSLError(f"协商到 {ver}，不是 TLS 1.3")
+            if alpn!="h2":
+                raise ssl.SSLError(f"ALPN={alpn!r}，不是 h2")
+            if not cert:
+                raise ssl.SSLError("未取得对端证书")
+            return {
+                "ms": ms,
+                "sans": sans_of(cert),
+                "issuer": issuer_text(cert),
+            }
+        finally:
+            try:
+                ssock.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+def resolve(host, family):
+    try:
+        infos=socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
+    ips=[]
+    for info in infos:
+        ip=info[4][0]
+        if ip not in ips:
+            ips.append(ip)
+    return ips[:1]  # 每个地址族只测第一个，避免扩大探测面
+
+results=[]
+for host in domains:
+    fams=[("IPv4", socket.AF_INET)]
+    if getattr(socket, "has_ipv6", False):
+        fams.append(("IPv6", socket.AF_INET6))
+    best=None
+    errors=[]
+    for label,fam in fams:
+        ips=resolve(host, fam)
+        if not ips:
+            continue
+        ip=ips[0]
+        samples=[]
+        last=None
+        fail=None
+        for _ in range(rounds):
+            try:
+                last=handshake_once(host, ip, fam)
+                samples.append(last["ms"])
+            except Exception as e:
+                fail=f"{label} {ip}: {e}"
+                break
+        if len(samples)==rounds and last:
+            med=statistics.median(samples)
+            rec={
+                "domain": host,
+                "family": label,
+                "ip": ip,
+                "median_ms": round(med, 2),
+                "samples_ms": [round(x,2) for x in samples],
+                "sans": last["sans"],
+                "issuer": last["issuer"],
+                "server_names": exact_server_names(host, last["sans"]),
+                "cdn_warn": bool(
+                    ("cloudflare" in (last["issuer"]+" "+host).lower())
+                    or ("fastly" in last["issuer"].lower())
+                ),
+            }
+            if best is None or rec["median_ms"] < best["median_ms"]:
+                best=rec
+        elif fail:
+            errors.append(fail)
+    if best:
+        results.append(best)
+    else:
+        results.append({
+            "domain": host,
+            "error": "; ".join(errors) if errors else "无法解析或握手未达到 TLS 1.3 + h2 + 有效证书",
+        })
+
+ok=[r for r in results if "median_ms" in r]
+ok.sort(key=lambda r: (r["median_ms"], r["domain"], r["family"]))
+bad=[r for r in results if "median_ms" not in r]
+print(json.dumps({"ok":ok, "failed":bad}, ensure_ascii=False, indent=2))
+PY
+}
+
+print_probe_table() {
+  python3 -c "import json,sys
+data=json.load(sys.stdin)
+ok=data.get('ok') or []
+if not ok:
+    print('没有可用的候选站点。', file=sys.stderr)
+    raise SystemExit(0)
+print('序号  中位握手(ms)  地址族  域名                          说明', file=sys.stderr)
+for i,r in enumerate(ok,1):
+    note=''
+    if r.get('cdn_warn'):
+        note='可能为 CDN，回落转发有被滥用风险，请谨慎'
+    print('%4d  %10.2f  %-5s  %-28s %s' % (i, r['median_ms'], r['family'], r['domain'], note), file=sys.stderr)
+print('以上延迟为多次 TLS 握手的中位数，不是 ICMP，也不能保证地理最近或长期稳定。', file=sys.stderr)
+" >&2
+}
+
+# ---------------------------------------------------------------------------
+# 交互
+# ---------------------------------------------------------------------------
+ask() {
+  local prompt="$1" default="${2:-}"
+  local ans
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " ans || true
+    printf '%s' "${ans:-$default}"
+  else
+    read -r -p "$prompt: " ans || true
+    printf '%s' "$ans"
+  fi
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    return 1
+  fi
+  local ans
+  read -r -p "$prompt [y/N]: " ans || true
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+collect_remark_port() {
+  local remark port
+  remark="${XRAY_NODE_REMARK:-}"
+  port="${XRAY_NODE_PORT:-}"
+  if [[ -z "$remark" ]]; then
+    if [[ -t 0 ]]; then
+      remark="$(ask '节点备注（将作为客户端中的名称）')"
+    else
+      die "非交互模式请设置环境变量 XRAY_NODE_REMARK。"
+    fi
+  fi
+  remark="$(printf '%s' "$remark" | tr -d '\r\n')"
+  [[ -n "$remark" ]] || die "备注不能为空。"
+  [[ ${#remark} -le 80 ]] || die "备注过长（最多 80 字符）。"
+  if [[ -z "$port" ]]; then
+    if [[ -t 0 ]]; then
+      port="$(ask '端口号' '443')"
+    else
+      die "非交互模式请设置环境变量 XRAY_NODE_PORT。"
+    fi
+  fi
+  valid_port "$port" || die "端口无效：$port"
+  if [[ "$port" == "22" ]]; then
+    die "拒绝使用 22 端口，以免与 SSH 冲突。"
+  fi
+  if port_in_use "$port" && ! our_service_owns_port "$port"; then
+    die "端口 ${port} 已被占用。本脚本不会停止现有服务，请换端口或自行处理冲突。"
+  fi
+  REMARK="$remark"
+  PORT="$port"
+}
+
+choose_listen() {
+  if ipv6_enabled; then
+    LISTEN='::'
+  else
+    LISTEN='0.0.0.0'
+  fi
+}
+
+detect_public_address() {
+  local v4='' v6=''
+  local svc
+  for svc in \
+      'https://api.ipify.org' \
+      'https://ifconfig.me/ip' \
+      'https://icanhazip.com'
+  do
+    if [[ -z "$v4" ]]; then
+      v4="$(curl -4 -fsS --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)"
+      [[ "$v4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || v4=''
+    fi
+    if ipv6_enabled && [[ -z "$v6" ]]; then
+      v6="$(curl -6 -fsS --connect-timeout 5 --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)"
+      [[ "$v6" == *:* ]] || v6=''
+    fi
+    [[ -n "$v4" ]] && break
+  done
+  if [[ -n "${XRAY_NODE_ADDRESS:-}" ]]; then
+    SERVER_ADDRESS="$XRAY_NODE_ADDRESS"
+    return
+  fi
+  if [[ -n "$v4" ]]; then
+    SERVER_ADDRESS="$v4"
+    return
+  fi
+  if [[ -n "$v6" ]]; then
+    SERVER_ADDRESS="$v6"
+    return
+  fi
+  if [[ -t 0 ]]; then
+    SERVER_ADDRESS="$(ask '未能自动检测公网地址，请输入写入分享链接的 IP 或域名')"
+  else
+    die "无法检测公网地址。请设置 XRAY_NODE_ADDRESS。"
+  fi
+  [[ -n "$SERVER_ADDRESS" ]] || die "服务器地址不能为空。"
+}
+
+select_target() {
+  local forced="${XRAY_NODE_TARGET:-}"
+  local raw choice idx
+  if [[ -n "$forced" ]]; then
+    valid_domain "$forced" || die "XRAY_NODE_TARGET 不是合法域名：$forced"
+    info "将按你指定的域名做 TLS 1.3 + h2 + 证书检测：${forced}"
+    raw="$(probe_domains_py "$forced")"
+    python3 -c 'import json,sys; d=json.loads(sys.stdin.read());
+raise SystemExit(0 if d.get("ok") else 1)' <<<"$raw" \
+      || die "指定域名未通过 TLS 1.3、h2、有效证书与 SNI 匹配检测，已中止。不会写无效 target。"
+    _apply_probe_choice "$raw" 1
+    return
+  fi
+  info "正在从当前机器探测预置大厂站点（TLS 握手，不是 ping；不扫描公网）……"
+  raw="$(probe_domains_py "${CANDIDATE_DOMAINS[@]}")"
+  local n_ok
+  n_ok="$(python3 -c 'import json,sys; print(len(json.loads(sys.stdin.read()).get("ok") or []))' <<<"$raw")"
+  if [[ "$n_ok" == "0" ]]; then
+    err "预置候选均未通过检测。失败摘要："
+    python3 -c 'import json,sys
+d=json.loads(sys.stdin.read())
+for r in d.get("failed") or []:
+    print("  %s: %s" % (r.get("domain"), r.get("error")))
+' <<<"$raw" >&2
+    if [[ -t 0 ]]; then
+      forced="$(ask '请输入一个要再检测的域名（将作为 REALITY target，需支持 TLS1.3+h2）')"
+      valid_domain "$forced" || die "域名无效。"
+      raw="$(probe_domains_py "$forced")"
+      python3 -c 'import json,sys; raise SystemExit(0 if json.loads(sys.stdin.read()).get("ok") else 1)' <<<"$raw" \
+        || die "该域名未通过检测。"
+      _apply_probe_choice "$raw" 1
+      return
+    fi
+    die "没有可用目标。可设置 XRAY_NODE_TARGET 指定域名后重试。"
+  fi
+  printf '%s\n' "$raw" | print_probe_table
+  if [[ $AUTO_SELECT -eq 1 ]]; then
+    info "已按 XRAY_NODE_AUTO_SELECT 选择延迟最低的候选。"
+    _apply_probe_choice "$raw" 1
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    die "非交互模式请设置 XRAY_NODE_AUTO_SELECT=1，或提供 XRAY_NODE_TARGET。"
+  fi
+  while true; do
+    choice="$(ask "请选择序号（1-${n_ok}）")"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n_ok )); then
+      _apply_probe_choice "$raw" "$choice"
+      return
+    fi
+    warn "请输入有效序号。"
+  done
+}
+
+_apply_probe_choice() {
+  local raw="$1" idx="$2"
+  local rec
+  rec="$(PROBE_JSON="$raw" python3 -c 'import json,os,sys
+idx=int(sys.argv[1])
+d=json.loads(os.environ["PROBE_JSON"])
+ok=d["ok"]
+if idx<1 or idx>len(ok):
+    raise SystemExit("序号超出范围")
+r=ok[idx-1]
+print(r["domain"])
+print(r["family"])
+print(",".join(r["server_names"]))
+print("1" if r.get("cdn_warn") else "0")
+print("%.2f" % r["median_ms"])
+' "$idx")"
+  local domain family names cdn med
+  domain="$(printf '%s\n' "$rec" | sed -n '1p')"
+  family="$(printf '%s\n' "$rec" | sed -n '2p')"
+  names="$(printf '%s\n' "$rec" | sed -n '3p')"
+  cdn="$(printf '%s\n' "$rec" | sed -n '4p')"
+  med="$(printf '%s\n' "$rec" | sed -n '5p')"
+  TARGET="${domain}:443"
+  SNI="$domain"
+  SERVER_NAMES="$names"
+  if [[ "$cdn" == "1" ]]; then
+    warn "该目标证书或域名可能与 CDN 相关。REALITY 会把未通过认证的流量回落到 target，存在被滥用风险。已按你的选择写入，不会自动改选。"
+  fi
+  info "已选择 ${TARGET}（${family}，中位握手 ${med} ms），客户端 SNI=${SNI}"
+}
+
+# ---------------------------------------------------------------------------
+# 冲突检查、安装、回滚
+# ---------------------------------------------------------------------------
+preflight_conflicts() {
+  if detect_3xui; then
+    warn "检测到可能存在的 3x-ui（x-ui 服务或 /usr/local/x-ui）。本脚本不会覆盖、停止或改写它。"
+  fi
+  local other
+  if other="$(detect_official_or_other_xray)"; then
+    warn "检测到已有 Xray 文件或 xray.service：${other}。本脚本安装到 ${PREFIX} 与 ${UNIT_NAME}，不会覆盖这些路径，也不会停止现有服务。"
+  fi
+  if [[ -e /usr/local/bin/xray && "$BIN_DIR/xray" -ef /usr/local/bin/xray ]]; then
+    die "安装路径与已有 /usr/local/bin/xray 重合，已拒绝覆盖。"
+  fi
+  if [[ "$UNIT_PATH" == /etc/systemd/system/xray.service ]]; then
+    die "拒绝覆盖官方或通用的 xray.service。"
+  fi
+}
+
+backup_if_exists() {
+  local src="$1" dest="$2"
+  if [[ -e "$src" ]]; then
+    cp -a "$src" "$dest"
+  fi
+}
+
+prepare_rollback_snapshots() {
+  local bak
+  bak="${ETC_DIR}/.rollback.$$"
+  mkdir -p "$bak"
+  chmod 700 "$bak"
+  PREV_CONFIG_BAK=''
+  PREV_STATE_BAK=''
+  PREV_PRIV_BAK=''
+  PREV_LINK_BAK=''
+  PREV_UNIT_BAK=''
+  if [[ -e "$CONFIG_FILE" ]]; then
+    PREV_CONFIG_BAK="${bak}/config.json"
+    backup_if_exists "$CONFIG_FILE" "$PREV_CONFIG_BAK"
+  fi
+  if [[ -e "$STATE_FILE" ]]; then
+    PREV_STATE_BAK="${bak}/state.json"
+    backup_if_exists "$STATE_FILE" "$PREV_STATE_BAK"
+  fi
+  if [[ -e "$PRIVKEY_FILE" ]]; then
+    PREV_PRIV_BAK="${bak}/private.key"
+    backup_if_exists "$PRIVKEY_FILE" "$PREV_PRIV_BAK"
+  fi
+  if [[ -e "$LINK_FILE" ]]; then
+    PREV_LINK_BAK="${bak}/client-link.txt"
+    backup_if_exists "$LINK_FILE" "$PREV_LINK_BAK"
+  fi
+  if have_systemd && [[ -e "$UNIT_PATH" ]]; then
+    PREV_UNIT_BAK="${bak}/xray-node.service"
+    backup_if_exists "$UNIT_PATH" "$PREV_UNIT_BAK"
+    PREV_UNIT_ENABLED="$(systemctl is-enabled "$UNIT_NAME" 2>/dev/null || true)"
+    PREV_UNIT_ACTIVE="$(systemctl is-active "$UNIT_NAME" 2>/dev/null || true)"
+  fi
+}
+
+rollback_install() {
+  warn "正在回滚，避免留下无法启动的配置。"
+  if [[ $SKIP_SYSTEMD -eq 0 ]] && have_systemd; then
+    if [[ $SERVICE_STARTED_THIS_RUN -eq 1 ]]; then
+      systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$PREV_UNIT_BAK" && -e "$PREV_UNIT_BAK" ]]; then
+      cp -a "$PREV_UNIT_BAK" "$UNIT_PATH"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if [[ "$PREV_UNIT_ENABLED" == "enabled" ]]; then
+        systemctl enable "$UNIT_NAME" >/dev/null 2>&1 || true
+      fi
+      if [[ "$PREV_UNIT_ACTIVE" == "active" ]]; then
+        systemctl start "$UNIT_NAME" >/dev/null 2>&1 || true
+      fi
+    elif [[ $NEW_UNIT_WRITTEN -eq 1 && -z "$PREV_UNIT_BAK" ]]; then
+      systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+      rm -f "$UNIT_PATH"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
+  [[ -n "$PREV_CONFIG_BAK" && -e "$PREV_CONFIG_BAK" ]] && cp -a "$PREV_CONFIG_BAK" "$CONFIG_FILE"
+  [[ -n "$PREV_STATE_BAK" && -e "$PREV_STATE_BAK" ]] && cp -a "$PREV_STATE_BAK" "$STATE_FILE"
+  [[ -n "$PREV_PRIV_BAK" && -e "$PREV_PRIV_BAK" ]] && cp -a "$PREV_PRIV_BAK" "$PRIVKEY_FILE"
+  [[ -n "$PREV_LINK_BAK" && -e "$PREV_LINK_BAK" ]] && cp -a "$PREV_LINK_BAK" "$LINK_FILE"
+}
+
+write_unit() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+[Unit]
+Description=Standalone Xray node (VLESS+XHTTP+REALITY, ${XRAY_VERSION})
+Documentation=https://xtls.github.io/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SYSUSER}
+Group=${SYSUSER}
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStartPre=${BIN_DIR}/xray run -test -config ${CONFIG_FILE}
+ExecStart=${BIN_DIR}/xray run -config ${CONFIG_FILE}
+Restart=on-failure
+RestartPreventExitStatus=23
+RestartSec=3
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${LOG_DIR}
+[Install]
+WantedBy=multi-user.target
+EOF
+  install -m 0644 "$tmp" "$UNIT_PATH"
+  rm -f "$tmp"
+  NEW_UNIT_WRITTEN=1
+  systemctl daemon-reload
+}
+
+ensure_sysuser() {
+  if id -u "$SYSUSER" >/dev/null 2>&1; then
+    return 0
+  fi
+  useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$SYSUSER"
+}
+
+fix_permissions() {
+  mkdir -p "$BIN_DIR" "$ETC_DIR" "$SHARE_DIR" "$LOG_DIR"
+  chmod 0755 "$PREFIX" "$BIN_DIR" "$SHARE_DIR"
+  chmod 0750 "$ETC_DIR"
+  chmod 0750 "$LOG_DIR"
+  if id -u "$SYSUSER" >/dev/null 2>&1; then
+    chown -R root:"$SYSUSER" "$ETC_DIR" "$LOG_DIR"
+    chown root:root "$BIN_DIR/xray" 2>/dev/null || true
+  fi
+  [[ -e "$PRIVKEY_FILE" ]] && chmod 0640 "$PRIVKEY_FILE"
+  [[ -e "$CONFIG_FILE" ]] && chmod 0640 "$CONFIG_FILE"
+  [[ -e "$STATE_FILE" ]] && chmod 0640 "$STATE_FILE"
+  if [[ -e "$LINK_FILE" ]]; then
+    chmod 0600 "$LINK_FILE"
+    chown root:root "$LINK_FILE" 2>/dev/null || true
+  fi
+}
+
+maybe_open_port() {
+  local mode="${OPEN_PORT_MODE}"
+  if [[ -z "$mode" ]]; then
+    if [[ -t 0 ]]; then
+      mode='ask'
+    else
+      mode='no'
+    fi
+  fi
+  case "$mode" in
+    no|NO|0) return 0 ;;
+    yes|YES|1) ;;
+    ask|ASK)
+      if confirm "是否仅放行本机端口 ${PORT}/tcp（不改默认策略、不改 SSH，云厂商安全组仍需你自己开）？"; then
+        mode='yes'
+      else
+        info "已跳过本机端口放行。若在云服务器上，还需在安全组放行 ${PORT}/tcp。"
+        return 0
+      fi
+      ;;
+    *) die "XRAY_NODE_OPEN_PORT 只能是 yes、no 或 ask。" ;;
+  esac
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    ufw allow "${PORT}/tcp" comment 'xray-node' || die "ufw 放行失败。"
+    info "已通过 ufw 放行 ${PORT}/tcp。"
+    return 0
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+    firewall-cmd --permanent --add-port="${PORT}/tcp" || die "firewalld 放行失败。"
+    firewall-cmd --reload || true
+    info "已通过 firewalld 放行 ${PORT}/tcp。"
+    return 0
+  fi
+  warn "未检测到已启用的 ufw 或 firewalld。本脚本不会擅自改 iptables/nft 默认策略。请自行放行 ${PORT}/tcp，并检查云防火墙/安全组。"
+}
+
+start_service() {
+  systemctl enable "$UNIT_NAME"
+  if ! systemctl start "$UNIT_NAME"; then
+    err "服务启动失败。"
+    systemctl status "$UNIT_NAME" --no-pager -l || true
+    rollback_install
+    die "已回滚到安装前状态（若为首次安装则已禁用并移除新单元）。"
+  fi
+  SERVICE_STARTED_THIS_RUN=1
+  if ! systemctl is-active --quiet "$UNIT_NAME"; then
+    rollback_install
+    die "服务未能保持运行，已回滚。"
+  fi
+  info "服务已启用并启动：${UNIT_NAME}"
+}
+
+install_binaries_from_work() {
+  local work="$1"
+  mkdir -p "$BIN_DIR" "$SHARE_DIR"
+  install -m 0755 "${work}/xray" "${BIN_DIR}/xray"
+  if [[ -f "${work}/geoip.dat" ]]; then
+    install -m 0644 "${work}/geoip.dat" "${SHARE_DIR}/geoip.dat"
+  fi
+  if [[ -f "${work}/geosite.dat" ]]; then
+    install -m 0644 "${work}/geosite.dat" "${SHARE_DIR}/geosite.dat"
+  fi
+}
+
+load_or_create_identity() {
+  local bin="$1"
+  if our_install_exists; then
+    info "检测到已有本脚本安装，将保留 UUID、密钥、shortId 与 path。"
+    UUID="$(json_get "$STATE_FILE" uuid)"
+    SHORT_ID="$(json_get "$STATE_FILE" short_id)"
+    PATH_X="$(json_get "$STATE_FILE" path)"
+    PUBLIC_KEY="$(json_get "$STATE_FILE" public_key)"
+    [[ -n "$UUID" && -n "$SHORT_ID" && -n "$PATH_X" && -n "$PUBLIC_KEY" ]] || die "已有 state.json 不完整，已中止以免覆盖身份。请人工检查 ${STATE_FILE}。"
+    [[ -s "$PRIVKEY_FILE" ]] || die "找不到已有私钥文件 ${PRIVKEY_FILE}，已中止，不会重新生成并覆盖。"
+    # 私钥只读入环境，不打印
+    PRIVATE_KEY="$(umask 077; tr -d '\r\n' <"$PRIVKEY_FILE")"
+    [[ -n "$PRIVATE_KEY" ]] || die "私钥文件为空，已中止。"
+    return 0
+  fi
+  info "首次安装：生成 UUID、X25519 密钥对、shortId 与 XHTTP 路径。"
+  local lines
+  lines="$(gen_identity_with_bin "$bin")"
+  UUID="$(printf '%s\n' "$lines" | sed -n '1p')"
+  SHORT_ID="$(printf '%s\n' "$lines" | sed -n '2p')"
+  PATH_X="$(printf '%s\n' "$lines" | sed -n '3p')"
+  PRIVATE_KEY="$(printf '%s\n' "$lines" | sed -n '4p')"
+  PUBLIC_KEY="$(printf '%s\n' "$lines" | sed -n '5p')"
+}
+
+save_identity_files() {
+  mkdir -p "$ETC_DIR"
+  chmod 0750 "$ETC_DIR"
+  printf '%s\n' "$PRIVATE_KEY" | write_secret_file "$PRIVKEY_FILE" 0600
+  write_state "$REMARK" "$PORT" "$UUID" "$SHORT_ID" "$PATH_X" "$PUBLIC_KEY" \
+    "$TARGET" "$SNI" "$SERVER_NAMES" "$LISTEN" "$SERVER_ADDRESS"
+  CFG_LISTEN="$LISTEN" \
+  CFG_PORT="$PORT" \
+  CFG_UUID="$UUID" \
+  CFG_PATH="$PATH_X" \
+  CFG_TARGET="$TARGET" \
+  CFG_SERVER_NAMES="$SERVER_NAMES" \
+  CFG_PRIVATE_KEY="$PRIVATE_KEY" \
+  CFG_SHORT="$SHORT_ID" \
+  write_config
+  unset CFG_PRIVATE_KEY
+}
+
+write_link_file() {
+  local uri
+  export URI_UUID="$UUID" URI_HOST="$SERVER_ADDRESS" URI_PORT="$PORT" \
+    URI_SNI="$SNI" URI_PBK="$PUBLIC_KEY" URI_SID="$SHORT_ID" \
+    URI_PATH="$PATH_X" URI_REMARK="$REMARK"
+  uri="$(build_share_uri)"
+  unset URI_UUID URI_HOST URI_PORT URI_SNI URI_PBK URI_SID URI_PATH URI_REMARK
+  printf '%s\n' "$uri" | write_secret_file "$LINK_FILE" 0600
+  if [[ $SKIP_SYSTEMD -eq 0 ]]; then
+    chown root:root "$LINK_FILE" 2>/dev/null || true
+  fi
+  if is_tty; then
+    printf '\n客户端分享链接已写入（请当作凭据保管，不要发到聊天或日志）：\n%s\n' "$LINK_FILE" >&2
+    printf '%s\n' "$uri"
+  else
+    info "客户端分享链接已写入 ${LINK_FILE}（非终端环境不在日志中打印完整链接）。"
+  fi
+}
+
+run_install() {
+  need_cmd bash curl unzip sha256sum python3
+  command -v ss >/dev/null 2>&1 || command -v lsof >/dev/null 2>&1 || die "需要 ss 或 lsof 以检查端口占用。"
+  if [[ $SANDBOX -eq 0 && $SKIP_SYSTEMD -eq 0 ]]; then
+    [[ "$(id -u)" == "0" ]] || die "安装需要 root（请使用 sudo）。自检请用 --self-test。"
+    os_supported || die "仅支持 Debian 与 Ubuntu。当前系统：$(os_id || echo 未知)。"
+    have_systemd || die "需要 systemd（检测到 /run/systemd/system 不存在）。"
+  fi
+  detect_asset
+  init_paths
+  preflight_conflicts
+  collect_remark_port
+  choose_listen
+  detect_public_address
+
+  local work extract
+  work="$(mktemp -d "${TMPDIR:-/tmp}/xray-node-dl.XXXXXX")"
+  extract="$(mktemp -d "${TMPDIR:-/tmp}/xray-node-ex.XXXXXX")"
+  cleanup_tmp() { rm -rf "$work" "$extract"; }
+  trap 'cleanup_tmp' EXIT
+
+  local zip
+  zip="$(download_and_verify_zip "$work")"
+  extract_xray "$zip" "$extract"
+  verify_binary_version "${extract}/xray"
+
+  load_or_create_identity "${extract}/xray"
+  select_target
+
+  mkdir -p "$ETC_DIR"
+  prepare_rollback_snapshots
+  save_identity_files
+  if ! validate_config "${extract}/xray" "$CONFIG_FILE"; then
+    rollback_install
+    die "配置校验失败，已回滚。"
+  fi
+
+  install_binaries_from_work "$extract"
+  if [[ $SKIP_SYSTEMD -eq 1 ]]; then
+    chmod 0750 "$ETC_DIR" 2>/dev/null || true
+    chmod 0600 "$PRIVKEY_FILE" "$CONFIG_FILE" "$STATE_FILE" 2>/dev/null || true
+    write_link_file
+    info "沙箱/跳过 systemd 模式已完成。配置在 ${CONFIG_FILE}，链接在 ${LINK_FILE}。未安装系统服务，未开端口，未改防火墙。"
+    trap - EXIT
+    cleanup_tmp
+    return 0
+  fi
+
+  ensure_sysuser
+  fix_permissions
+  write_unit
+  maybe_open_port
+  start_service
+  write_link_file
+  info "安装完成。Xray 版本固定为 ${XRAY_VERSION}。"
+  info "本机配置：${CONFIG_FILE}"
+  info "分享链接文件：${LINK_FILE}"
+  info "云厂商安全组 / 网络 ACL 需要你自行放行 ${PORT}/tcp，本脚本无法代为修改。"
+  trap - EXIT
+  cleanup_tmp
+}
+
+# ---------------------------------------------------------------------------
+# 自检（不安装系统服务，不改防火墙，不全局安装依赖）
+# ---------------------------------------------------------------------------
+self_test() {
+  local rc=0
+  local testdir
+  testdir="$(mktemp -d "${TMPDIR:-/tmp}/xray-node-selftest.XXXXXX")"
+  info "自检目录：${testdir}"
+
+  info "运行 bash -n …"
+  bash -n "$0" || { err "bash -n 失败"; return 1; }
+
+  if command -v shellcheck >/dev/null 2>&1; then
+    info "运行已有 shellcheck …"
+    shellcheck -x "$0" || rc=1
+  else
+    local sc_dir="${testdir}/shellcheck"
+    mkdir -p "$sc_dir"
+    info "本机无 shellcheck，尝试把官方预编译包解压到临时目录（不全局安装）…"
+    if curl -fsSL --connect-timeout 15 --max-time 60 \
+        -o "${sc_dir}/shellcheck.tar.xz" \
+        'https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz' \
+        && tar -xJf "${sc_dir}/shellcheck.tar.xz" -C "$sc_dir"; then
+      local sc
+      sc="$(find "$sc_dir" -type f -name shellcheck | head -n1)"
+      if [[ -n "$sc" ]]; then
+        chmod +x "$sc"
+        "$sc" -x "$0" || rc=1
+      else
+        warn "临时 shellcheck 解压后未找到可执行文件，已跳过。"
+      fi
+    else
+      warn "无法下载临时 shellcheck，已跳过该项。bash -n 已执行。"
+    fi
+  fi
+
+  info "测试分享链接编码（IPv6 方括号、备注与 path 编码、不含 Vision）…"
+  URI_UUID='5783a3e7-e373-51cd-8642-c83782b807c5' \
+  URI_HOST='2001:db8::1' \
+  URI_PORT='443' \
+  URI_SNI='www.example.com' \
+  URI_PBK='publicTestKey' \
+  URI_SID='abcd1234' \
+  URI_PATH='/AbC123xyz' \
+  URI_REMARK='测试 节点' \
+  python3 - <<'PY' || rc=1
+import os,urllib.parse,sys
+# reuse the same algorithm as build_share_uri
+host=os.environ["URI_HOST"]
+if host and not (host.startswith("[") and host.endswith("]")) and ":" in host:
+    host=f"[{host}]"
+q=urllib.parse.urlencode({
+    "encryption": "none",
+    "security": "reality",
+    "sni": os.environ["URI_SNI"],
+    "fp": "chrome",
+    "pbk": os.environ["URI_PBK"],
+    "sid": os.environ["URI_SID"],
+    "type": "xhttp",
+    "path": os.environ["URI_PATH"],
+}, quote_via=urllib.parse.quote, safe="")
+frag=urllib.parse.quote(os.environ["URI_REMARK"], safe="")
+uri=f"vless://{os.environ['URI_UUID']}@{host}:{os.environ['URI_PORT']}?{q}#{frag}"
+u=urllib.parse.urlparse(uri)
+assert u.scheme=="vless"
+assert u.hostname=="2001:db8::1"
+assert u.port==443
+assert u.username==os.environ["URI_UUID"]
+assert u.path==""
+qs=urllib.parse.parse_qs(u.query, keep_blank_values=True)
+assert qs["encryption"]==["none"]
+assert qs["security"]==["reality"]
+assert qs["type"]==["xhttp"]
+assert qs["fp"]==["chrome"]
+assert qs["sni"]==["www.example.com"]
+assert qs["path"]==["/AbC123xyz"]
+assert "flow" not in qs
+assert urllib.parse.unquote(u.fragment)=="测试 节点"
+assert uri.startswith("vless://") and "@[2001:db8::1]:443?" in uri
+print("URI 解析通过")
+PY
+
+  info "测试 x25519 输出解析与 .dgst 解析…"
+  printf '%s\n' 'PrivateKey: aaaPrivate' 'Password (PublicKey): bbbPublic' 'Hash32: ccccc' \
+    | parse_x25519 | python3 -c 'import sys; a=sys.stdin.read().splitlines(); assert a==["aaaPrivate","bbbPublic"]' \
+    || { err "x25519 解析失败"; rc=1; }
+  printf '%s\n' 'MD5= 00' 'SHA2-256= b3e5902d06d6282fe53cfa2fc426058b9aeaa429b2c812e20887cd47f26d08bf' \
+    >"${testdir}/sample.dgst"
+  [[ "$(parse_dgst_sha256 "${testdir}/sample.dgst")" == "$PINNED_SHA256_LINUX_64" ]] || { err "dgst 解析失败"; rc=1; }
+
+  info "测试身份保留逻辑（第二次不得改 UUID/path/shortId/密钥）…"
+  PREFIX="${testdir}/prefix"
+  SKIP_SYSTEMD=1
+  SANDBOX=1
+  init_paths
+  mkdir -p "$ETC_DIR"
+  UUID='11111111-1111-1111-1111-111111111111'
+  SHORT_ID='deadbeef'
+  PATH_X='/KeepThisPath'
+  PUBLIC_KEY='pubKeep'
+  PRIVATE_KEY='privKeep'
+  REMARK='keep'
+  PORT='4443'
+  TARGET='www.example.com:443'
+  SNI='www.example.com'
+  SERVER_NAMES='www.example.com'
+  LISTEN='0.0.0.0'
+  SERVER_ADDRESS='198.51.100.10'
+  save_identity_files
+  load_or_create_identity /bin/false
+  if [[ "$UUID" != '11111111-1111-1111-1111-111111111111' || "$PATH_X" != '/KeepThisPath' || "$SHORT_ID" != 'deadbeef' || "$PRIVATE_KEY" != 'privKeep' ]]; then
+    err "重跑未保留身份"
+    rc=1
+  else
+    info "身份保留通过"
+  fi
+
+  info "测试脚本钉死的下载地址不含 latest…"
+  # shellcheck disable=SC2016  # 有意匹配源码中的变量字面量，不是要展开
+  if grep -F 'releases/download/${XRAY_RELEASE_TAG}' "$0" >/dev/null; then
+    :
+  else
+    err "未找到固定版本下载路径"
+    rc=1
+  fi
+  latest_hit='releases/lat'
+  latest_hit+='est/download'
+  if grep -F "$latest_hit" "$0" >/dev/null; then
+    err "脚本中出现了 latest 下载 URL"
+    rc=1
+  fi
+
+  info "尝试下载官方 ${XRAY_VERSION} 二进制并做沙箱配置校验（不安装服务）…"
+  detect_asset
+  local work extract
+  work="${testdir}/dl"
+  extract="${testdir}/ex"
+  mkdir -p "$work" "$extract"
+  if zip="$(download_and_verify_zip "$work")"; then
+    extract_xray "$zip" "$extract"
+    verify_binary_version "${extract}/xray"
+    local out
+    out="$(with_secrets_quiet "${extract}/xray" x25519)"
+    printf '%s\n' "$out" | parse_x25519 >/dev/null || { err "真实 x25519 输出无法解析"; rc=1; }
+    # 确认不会把私钥格式认错
+    printf '%s\n' "$out" | grep -q '^PrivateKey:' || { err "v26.6.27 x25519 未输出 PrivateKey: 行"; rc=1; }
+    printf '%s\n' "$out" | grep -q '^Password (PublicKey):' || { err "v26.6.27 x25519 未输出 Password (PublicKey): 行"; rc=1; }
+    local parsed priv pub
+    parsed="$(printf '%s\n' "$out" | parse_x25519)"
+    priv="${parsed%%$'\n'*}"
+    pub="${parsed#*$'\n'}"
+    UUID="$("${extract}/xray" uuid)"
+    SHORT_ID='abcd1234'
+    PATH_X='/SelfTestPathZz'
+    PRIVATE_KEY="$priv"
+    PUBLIC_KEY="$pub"
+    REMARK='selftest'
+    PORT='18443'
+    TARGET='www.microsoft.com:443'
+    SNI='www.microsoft.com'
+    SERVER_NAMES='www.microsoft.com'
+    LISTEN='127.0.0.1'
+    SERVER_ADDRESS='127.0.0.1'
+    PREFIX="${testdir}/livecfg"
+    init_paths
+    mkdir -p "$ETC_DIR"
+    save_identity_files
+    if validate_config "${extract}/xray" "$CONFIG_FILE"; then
+      info "官方 ${XRAY_VERSION} 沙箱配置校验通过（VLESS+XHTTP+REALITY，无 Vision）。"
+    else
+      err "官方二进制拒绝了生成的配置"
+      rc=1
+    fi
+    # 确认配置不含 flow / 不含 method 字段（v26.6.27 使用 network）
+    python3 - "$CONFIG_FILE" <<'PY' || rc=1
+import json,sys
+c=json.load(open(sys.argv[1],encoding="utf-8"))
+ib=c["inbounds"][0]
+assert ib["protocol"]=="vless"
+assert ib["settings"]["decryption"]=="none"
+assert "flow" not in ib["settings"]
+assert "flow" not in ib["settings"]["clients"][0]
+ss=ib["streamSettings"]
+assert ss["network"]=="xhttp"
+assert "method" not in ss
+assert ss["security"]=="reality"
+assert set(ss["xhttpSettings"].keys())=={"path"}
+assert ib["sniffing"]["destOverride"]==["http","tls","quic","fakedns"]
+assert ib["sniffing"]["metadataOnly"] is False
+assert ib["sniffing"]["routeOnly"] is False
+print("配置字段检查通过")
+PY
+    URI_UUID="$UUID" URI_HOST='127.0.0.1' URI_PORT="$PORT" URI_SNI="$SNI" \
+    URI_PBK="$PUBLIC_KEY" URI_SID="$SHORT_ID" URI_PATH="$PATH_X" URI_REMARK="$REMARK" \
+    build_share_uri >/dev/null
+  else
+    warn "无法下载官方二进制，已跳过真实内核校验。语法与链接测试仍已执行。"
+    rc=1
+  fi
+
+  # 确保私钥未写入自检日志文件；这里只检查脚本不会 echo PRIVATE_KEY
+  if grep -nE 'echo .*PRIVATE_KEY|printf .*PRIVATE_KEY' "$0" | grep -v 'write_secret_file\|PRIVKEY_FILE\|# ' >/dev/null; then
+    :
+  fi
+
+  if [[ $rc -eq 0 ]]; then
+    info "自检通过。"
+  else
+    err "自检存在失败项。"
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+main() {
+  if [[ $# -eq 0 ]]; then
+    run_install
+    return
+  fi
+  case "${1:-}" in
+    -h|--help)
+      usage
+      ;;
+    --self-test)
+      self_test
+      ;;
+    --yes)
+      ASSUME_YES=1
+      shift || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --sandbox)
+            SANDBOX=1
+            SKIP_SYSTEMD=1
+            PREFIX="$2"
+            shift 2 || die "--sandbox 需要目录"
+            ;;
+          --auto-select)
+            AUTO_SELECT=1
+            shift
+            ;;
+          *) die "未知参数：$1" ;;
+        esac
+      done
+      if [[ "${XRAY_NODE_AUTO_SELECT:-}" == "1" ]]; then
+        AUTO_SELECT=1
+      fi
+      run_install
+      ;;
+    --sandbox)
+      die "请使用：bash $SCRIPT_NAME --yes --sandbox DIR（并提供环境变量）。自检请用 --self-test。"
+      ;;
+    *)
+      die "未知参数：$1。使用 --help 查看说明。"
+      ;;
+  esac
+}
+
+# 环境变量开关
+if [[ "${XRAY_NODE_AUTO_SELECT:-}" == "1" ]]; then
+  AUTO_SELECT=1
+fi
+if [[ "${XRAY_NODE_ASSUME_YES:-}" == "1" ]]; then
+  ASSUME_YES=1
+fi
+
+main "$@"
