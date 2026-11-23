@@ -21,18 +21,19 @@ readonly PINNED_SHA256_BIN_LINUX_64='8ef87ac07f95617e094b8e9302ea3e0c2d0edaa7045
 readonly PINNED_SHA256_BIN_LINUX_ARM64='53ad04b1ddcba6f4ff8834b3db2e9a596456441259cea3e4f03f86cd39e22884'
 
 readonly SCRIPT_NAME='install-ss-node.sh'
-readonly SCRIPT_VERSION='1.0.1'
+readonly SCRIPT_VERSION='1.1.0'
 readonly UNIT_NAME='ss-node.service'
 readonly DEFAULT_PREFIX='/opt/ss-node'
 readonly SYSUSER='ss-node'
 readonly XHTTP_PREFIX_DEFAULT='/opt/xray-node'
 readonly XHTTP_UNIT_NAME='xray-node.service'
-readonly DEFAULT_METHOD='aes-128-gcm'
+readonly DEFAULT_METHOD='aes-256-gcm'
 readonly DEFAULT_PORT='443'
 readonly SS_NETWORK='tcp,udp'
 
 # 明确默认 + 少量安全可选项。不提供 none/plain，也不提供已淘汰流密码。
 readonly METHOD_AES128='aes-128-gcm'
+readonly METHOD_AES256='aes-256-gcm'
 readonly METHOD_CHACHA='chacha20-ietf-poly1305'
 readonly METHOD_SS2022='2022-blake3-aes-128-gcm'
 
@@ -70,6 +71,7 @@ METHOD=''
 PASSWORD=''
 BIN_SOURCE_NOTE=''
 REQUESTED_PORT=''
+REQUESTED_METHOD=''
 
 PREV_CONFIG_BAK=''
 PREV_STATE_BAK=''
@@ -117,11 +119,18 @@ XHTTP 或 TLS，不申请域名证书。认证与加密由 SS 自身提供。
   sudo bash ${SCRIPT_NAME} --yes           非交互：需已通过环境变量提供备注；端口未指定时用推荐的 443
   sudo bash ${SCRIPT_NAME} --change-port [端口]
                                            给已安装节点更换端口（保留密码、算法和名称；无端口则交互询问）
-  sudo bash ${SCRIPT_NAME} --info          只读显示已安装节点信息与完整导入链接（需 root；不安装、不改文件、不重启）
+  sudo bash ${SCRIPT_NAME} --change-method [算法]
+                                           给已安装节点更换加密方式（保留密码、端口、地址和名称）
+  sudo bash ${SCRIPT_NAME} --info          只读显示地址、端口、明文密码、算法与完整导入链接（需 root；不安装、不改文件、不重启）
   bash ${SCRIPT_NAME} --self-test          本地自检（不安装系统服务、不开端口、不改防火墙）
   bash ${SCRIPT_NAME} --help
 
-新机器若缺依赖，可先以 root 一次补齐：
+把脚本放到 GitHub 后，在目标 VPS 上可用：
+  curl -fL --retry 3 'https://raw.githubusercontent.com/no00see123/vrtex-new/refs/heads/main/SS' -o install-ss-node.sh && bash install-ss-node.sh
+
+仅重新下载并再跑一次安装，不会把已有节点从 aes-128-gcm 改成 aes-256-gcm；已有落地请用 --change-method。
+
+新机器若缺依赖，可先以 root 一次补齐（不要和外层 curl 写在同一条强制检查里）：
   apt-get update && apt-get install -y curl ca-certificates python3 unzip iproute2
 
 端口由你填写或确认，不会随机生成。新安装默认推荐 ${DEFAULT_PORT}（TCP 与 UDP 同一端口）。
@@ -133,7 +142,7 @@ XHTTP 或 TLS，不申请域名证书。认证与加密由 SS 自身提供。
   SS_NODE_NAME              同上（别名）
   SS_NODE_PORT              监听端口（同时用于 TCP 和 UDP）
   SS_NODE_ADDRESS           写入本机落地分享链接的地址（IPv4 / IPv6 / 域名）
-  SS_NODE_METHOD            加密：${METHOD_AES128}（默认）、${METHOD_CHACHA}、${METHOD_SS2022}
+  SS_NODE_METHOD            新装加密：${METHOD_AES256}（默认）、${METHOD_AES128}、${METHOD_CHACHA}、${METHOD_SS2022}；重跑已有安装不会用它来改算法
   SS_NODE_OPEN_PORT=yes|no|ask     是否放行本机最小 TCP+UDP 端口（默认：有终端则 ask，否则 no）
   SS_NODE_INSTALL_DEPS=yes|no|ask  缺失依赖时是否 apt 安装（默认同上；未确认则不装）
   SS_NODE_XRAY_BIN          额外指定一个已有的官方 ${XRAY_VERSION} 二进制（仍校验钉死哈希后再复制）
@@ -246,12 +255,20 @@ is_ss2022_method() {
   [[ "$m" == 2022-blake3-* ]]
 }
 
+is_classic_aead_method() {
+  case "$1" in
+    aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 canonical_method() {
   python3 - "$1" <<'PYCODE'
 import sys
 raw=(sys.argv[1] or "").strip().lower()
 aliases={
   "aes-128-gcm":"aes-128-gcm",
+  "aes-256-gcm":"aes-256-gcm",
   "chacha20-ietf-poly1305":"chacha20-ietf-poly1305",
   "chacha20-poly1305":"chacha20-ietf-poly1305",
   "2022-blake3-aes-128-gcm":"2022-blake3-aes-128-gcm",
@@ -1395,8 +1412,14 @@ detect_public_address() {
 
 prompt_share_address() {
   local raw="${SS_NODE_ADDRESS:-}"
+  local saved="${1:-}"
   if [[ -n "$raw" ]]; then
     SERVER_ADDRESS="$raw"
+    return
+  fi
+  if [[ -n "$saved" ]]; then
+    SERVER_ADDRESS="$saved"
+    info "重复安装保留落地地址：${SERVER_ADDRESS}。不会向公网重新查询或改写已保存的地址。"
     return
   fi
   detect_public_address
@@ -1448,24 +1471,29 @@ load_or_create_identity() {
 prompt_method() {
   local raw="${SS_NODE_METHOD:-}"
   local saved="${1:-}"
-  if [[ -n "$saved" && -z "$raw" ]]; then
+  # 已有节点：重跑安装必须保留原算法。仅下载并再跑一次安装不会迁移到新的默认值。
+  if [[ -n "$saved" ]]; then
     METHOD="$(canonical_method "$saved")" || die "已保存的加密方式无效。"
-    info "重复安装保留加密方式：${METHOD}"
+    if [[ -n "$raw" ]]; then
+      local want=''
+      want="$(canonical_method "$raw")" || die "不支持的加密方式：${raw}。不支持 none/plain 或流密码。"
+      if [[ "$want" != "$METHOD" ]]; then
+        warn "已安装节点的加密方式是 ${METHOD}。重新运行安装不会改算法（也就不会自动改成默认的 ${DEFAULT_METHOD}）。如需迁移并保留密码、端口、地址和名称，请使用：sudo bash ${SCRIPT_NAME} --change-method ${want}"
+      else
+        info "重复安装保留加密方式：${METHOD}。仅重新下载并再跑一次安装不会改算法。如需迁移并保留密码、端口、地址和名称，请使用：sudo bash ${SCRIPT_NAME} --change-method ${DEFAULT_METHOD}"
+      fi
+    else
+      info "重复安装保留加密方式：${METHOD}。仅重新下载并再跑一次安装不会改算法。如需迁移并保留密码、端口、地址和名称，请使用：sudo bash ${SCRIPT_NAME} --change-method ${DEFAULT_METHOD}"
+    fi
     return 0
   fi
   if [[ -n "$raw" ]]; then
-    METHOD="$(canonical_method "$raw")" || die "不支持的加密方式：${raw}。可选：${METHOD_AES128}（默认）、${METHOD_CHACHA}、${METHOD_SS2022}。不支持 none/plain 或流密码。"
-    if [[ -n "$saved" && "$METHOD" != "$saved" ]]; then
-      if is_ss2022_method "$saved" || is_ss2022_method "$METHOD"; then
-        die "已安装节点的加密方式是 ${saved}。不能在重跑时改到 ${METHOD}：传统 AEAD 与 SS2022 的密钥格式不同，本脚本不会为此覆盖已有密码。如需更换，请人工处理后再安装。"
-      fi
-      info "将把传统 AEAD 算法从 ${saved} 改为 ${METHOD}，并保留原密码。"
-    fi
+    METHOD="$(canonical_method "$raw")" || die "不支持的加密方式：${raw}。可选：${METHOD_AES256}（默认）、${METHOD_AES128}、${METHOD_CHACHA}、${METHOD_SS2022}。不支持 none/plain 或流密码。"
     return 0
   fi
   if [[ $ASSUME_YES -eq 1 ]]; then
     METHOD="$DEFAULT_METHOD"
-    info "未指定加密方式，使用默认 ${METHOD}（传统 AEAD，便于兼容未知第三方中转）。"
+    info "未指定加密方式，新安装使用默认 ${METHOD}（传统 AEAD，便于与常见 3x-ui 出站选项对齐）。"
     return 0
   fi
   if [[ ! -t 0 ]]; then
@@ -1473,42 +1501,47 @@ prompt_method() {
   fi
   cat >&2 <<EOF
 请选择加密方式（输入编号，直接回车为 1）：
-  1) ${METHOD_AES128}            [默认] 传统 AEAD，第三方中转兼容面通常最广
-  2) ${METHOD_CHACHA}   传统 AEAD，无 AES-NI 的机器往往更合适
-  3) ${METHOD_SS2022}    Shadowsocks 2022，重放保护更完整，但中转必须明确支持
-说明：官方文档更推荐 SS2022；本脚本默认仍用传统 AEAD，是因为未知中转不一定支持 2022。
-      纯四层透传（只转发字节）通常不关心算法；若中转要识别/终止 SS 协议，则必须与落地算法一致。
+  1) ${METHOD_AES256}            [默认] 传统 AEAD，与常见 3x-ui 出站选项一致
+  2) ${METHOD_AES128}            传统 AEAD
+  3) ${METHOD_CHACHA}   传统 AEAD，无 AES-NI 的机器往往更合适
+  4) ${METHOD_SS2022}    Shadowsocks 2022，重放保护更完整，但中转必须明确支持
+说明：官方文档更推荐 SS2022；默认仍用传统 AEAD。会识别或终止 SS 的中转（例如 3x-ui 出站）必须与落地算法一致。
+      已有节点若要改算法，请用 --change-method，不要指望重新跑安装。
       不支持 none/plain，也不提供已淘汰的流密码。
 EOF
   raw="$(ask '加密方式' '1')"
   case "$raw" in
-    1|"$METHOD_AES128"|"") METHOD="$METHOD_AES128" ;;
-    2|"$METHOD_CHACHA"|chacha20-poly1305) METHOD="$METHOD_CHACHA" ;;
-    3|"$METHOD_SS2022") METHOD="$METHOD_SS2022" ;;
+    1|"$METHOD_AES256"|"") METHOD="$METHOD_AES256" ;;
+    2|"$METHOD_AES128") METHOD="$METHOD_AES128" ;;
+    3|"$METHOD_CHACHA"|chacha20-poly1305) METHOD="$METHOD_CHACHA" ;;
+    4|"$METHOD_SS2022") METHOD="$METHOD_SS2022" ;;
     *) die "无效选择：${raw}" ;;
   esac
 }
 
 prompt_inputs() {
-  local raw_name raw_port saved_remark saved_port saved_method
+  local raw_name raw_port saved_remark saved_port saved_method saved_address
   saved_remark=''
   saved_port=''
   saved_method=''
+  saved_address=''
   if our_install_exists; then
     saved_remark="$(json_get "$STATE_FILE" remark || true)"
     saved_port="$(json_get "$STATE_FILE" port || true)"
     saved_method="$(json_get "$STATE_FILE" method || true)"
+    saved_address="$(json_get "$STATE_FILE" address || true)"
   fi
 
   raw_name="${SS_NODE_REMARK:-${SS_NODE_NAME:-}}"
   if [[ -z "$raw_name" ]]; then
-    if [[ $ASSUME_YES -eq 1 ]]; then
+    if [[ -n "$saved_remark" && $ASSUME_YES -eq 1 ]]; then
+      raw_name="$saved_remark"
+      info "重复安装保留节点名称：${raw_name}"
+    elif [[ $ASSUME_YES -eq 1 ]]; then
       die "非交互模式需要设置 SS_NODE_REMARK（节点名称按你的备注原样使用，不会强制加 SS- 前缀）。"
-    fi
-    if [[ ! -t 0 ]]; then
+    elif [[ ! -t 0 ]]; then
       die "没有终端可询问节点名称。请设置 SS_NODE_REMARK。"
-    fi
-    if [[ -n "$saved_remark" ]]; then
+    elif [[ -n "$saved_remark" ]]; then
       raw_name="$(ask "节点名称（直接回车保留 ${saved_remark}）" "$saved_remark")"
     else
       raw_name="$(ask '节点名称（按你的备注原样使用，不会自动加 SS- 前缀）')"
@@ -1539,7 +1572,7 @@ prompt_inputs() {
   assert_ss_port_free "$PORT"
 
   prompt_method "$saved_method"
-  prompt_share_address
+  prompt_share_address "$saved_address"
 }
 
 write_link_file() {
@@ -1549,19 +1582,55 @@ write_link_file() {
   if [[ $SKIP_SYSTEMD -eq 0 ]]; then
     chown root:root "$LINK_FILE" 2>/dev/null || true
   fi
-  if is_tty; then
-    cat <<EOF
+  info "本机落地分享链接已写入受限文件：${LINK_FILE}（请当凭据保管，不要发到聊天或日志）。落地链接与中转入口链接不是同一条。"
+}
 
-本机落地分享链接（指向这台机器当前填写的地址和端口，含密码，请当凭据保管，不要发到聊天或日志）：
-${uri}
+# 把地址分类为 IP 或域名；空值报错，不向公网查询、不编造。
+format_server_address_line() {
+  python3 - "$1" <<'PYCODE'
+import ipaddress,sys
+raw=(sys.argv[1] or "").strip()
+if not raw:
+    sys.stderr.write("服务器地址为空，拒绝编造或向公网查询。\n")
+    sys.exit(2)
+core=raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+try:
+    ipaddress.ip_address(core)
+    print("服务器地址（IP）：%s" % raw)
+except ValueError:
+    print("服务器地址（域名）：%s" % raw)
+PYCODE
+}
 
-若客户端要先连第三方中转，应使用中转入口的 IP/域名和端口（或向中转方索取他们生成的入口链接）。
-落地原始链接与前端中转链接不是同一条，本脚本无法自动知道中转入口。
-已写入受限文件：${LINK_FILE}
-EOF
-  else
-    info "本机落地分享链接已写入 ${LINK_FILE}（非终端环境不在日志中打印完整链接）。落地链接与中转入口链接不是同一条。"
+# 第一屏连接参数卡：地址、端口、明文密码、算法、协议、传输、安全、UoT、完整链接。
+print_connection_card() {
+  local uri line_addr xtrace_was=0
+  case "$-" in *x*) xtrace_was=1; set +x ;; esac
+  if [[ -z "${SERVER_ADDRESS:-}" ]]; then
+    [[ $xtrace_was -eq 1 ]] && set -x
+    die "服务器地址为空，无法显示连接信息。不会向公网查询或编造地址。"
   fi
+  line_addr="$(format_server_address_line "$SERVER_ADDRESS")" || {
+    [[ $xtrace_was -eq 1 ]] && set -x
+    die "服务器地址无效，无法显示连接信息。"
+  }
+  uri="$(with_secrets_quiet build_share_uri)"
+  cat <<EOF
+${line_addr}
+端口：${PORT}
+密码：${PASSWORD}
+加密方式：${METHOD}
+协议：Shadowsocks
+传输：RAW（普通 TCP 流；入站同时监听 TCP 与 UDP）
+安全：无（未启用 TLS。这不等于未加密，流量由 Shadowsocks 自身加密。）
+UDP over TCP（UoT）：关闭
+完整分享链接：
+${uri}
+EOF
+  if [[ $xtrace_was -eq 1 ]]; then
+    set -x
+  fi
+  return 0
 }
 
 save_identity_files() {
@@ -1625,6 +1694,9 @@ run_install() {
   if [[ $SKIP_SYSTEMD -eq 1 ]]; then
     fix_permissions
     write_link_file
+    echo
+    print_connection_card
+    echo
     print_udp_caveat
     info "沙箱/跳过 systemd 模式已完成。配置在 ${CONFIG_FILE}，链接在 ${LINK_FILE}。未安装系统服务，未开端口，未改防火墙。"
     trap - EXIT
@@ -1639,6 +1711,9 @@ run_install() {
   maybe_open_ports
   start_service
   write_link_file
+  echo
+  print_connection_card
+  echo
   print_udp_caveat
   info "安装完成。Xray 版本固定为 ${XRAY_VERSION}。服务 ${UNIT_NAME} 与 XHTTP 服务相互独立。"
   info "本机配置：${CONFIG_FILE}"
@@ -1748,10 +1823,94 @@ run_change_port() {
   assert_runtime_access
   restart_our_service_after_port_change
   maybe_open_new_ports
+  echo
+  print_connection_card
+  echo
   info "换端口完成：${OLD_PORT} -> ${PORT}（TCP/UDP）。显示名：${REMARK}；加密方式仍是 ${METHOD}。"
   info "更新后的客户端链接：${LINK_FILE}"
   info "请更新客户端或中转入口配置。云安全组需放行新的 TCP/UDP ${PORT}，并同步中转后端映射。旧端口规则未删除。"
 }
+
+prompt_change_method() {
+  local raw="${REQUESTED_METHOD:-}"
+  if [[ -z "$raw" && -n "${SS_NODE_METHOD:-}" ]]; then
+    raw="${SS_NODE_METHOD}"
+  fi
+  if [[ -z "$raw" ]]; then
+    if [[ $ASSUME_YES -eq 1 ]]; then
+      die "非交互更换加密方式需要提供算法：sudo bash ${SCRIPT_NAME} --change-method ${DEFAULT_METHOD}"
+    fi
+    if [[ ! -t 0 ]]; then
+      die "没有终端可询问新算法。请使用：sudo bash ${SCRIPT_NAME} --change-method ${DEFAULT_METHOD}"
+    fi
+    printf '当前加密方式是 %s。请输入新算法（推荐 %s；也可填 %s 或 %s）：' "$METHOD" "$DEFAULT_METHOD" "$METHOD_AES128" "$METHOD_CHACHA" >&2
+    read -r raw
+  fi
+  raw="$(printf '%s' "$raw" | awk '{$1=$1; print}')"
+  METHOD="$(canonical_method "$raw")" || die "不支持的加密方式：${raw:-空}。可在传统 AEAD 之间切换：${METHOD_AES256}、${METHOD_AES128}、${METHOD_CHACHA}。Shadowsocks 2022 与传统 AEAD 的密码格式不同，不能用此命令迁移。"
+}
+
+run_change_method() {
+  local old_method
+  if [[ $SANDBOX -eq 0 ]]; then
+    if [[ "$(id -u)" != "0" ]]; then
+      die "更换加密方式需要 root。请使用：sudo bash ${SCRIPT_NAME} --change-method ${DEFAULT_METHOD}"
+    fi
+    os_supported || die "仅支持 Debian 或 Ubuntu（当前：$(os_id:-未知)）。"
+    have_systemd || die "需要 systemd。"
+  fi
+  init_paths
+  if [[ $SANDBOX -eq 0 ]]; then
+    command -v python3 >/dev/null 2>&1 || die "缺少命令：python3。"
+  fi
+  require_ss_installed
+  old_method="$METHOD"
+  prompt_change_method
+  if [[ "$METHOD" == "$old_method" ]]; then
+    info "当前已经是 ${METHOD}，无需修改。"
+    return 0
+  fi
+  if is_ss2022_method "$old_method" || is_ss2022_method "$METHOD"; then
+    die "不能在 ${old_method} 与 ${METHOD} 之间自动迁移：传统 AEAD 与 Shadowsocks 2022 的密码格式不同，本命令不会改写或丢弃已有密码。请保持原算法，或人工另行处理。"
+  fi
+  if ! is_classic_aead_method "$old_method" || ! is_classic_aead_method "$METHOD"; then
+    die "只允许在传统 AEAD（${METHOD_AES256}、${METHOD_AES128}、${METHOD_CHACHA}）之间切换并保留原密码。已拒绝 ${old_method} -> ${METHOD}。"
+  fi
+  validate_password_for_method "$METHOD" "$PASSWORD" || die "现有密码不符合 ${METHOD} 的格式要求，已中止，不会改写配置。"
+  info "将把加密方式从 ${old_method} 改为 ${METHOD}。会保留密码、端口、地址和节点名称，不会重新生成密码，也不会改端口或下载/升级二进制。"
+  mkdir -p "$ETC_DIR"
+  prepare_rollback_snapshots
+  save_identity_files
+  if [[ $SANDBOX -eq 0 || -x "${BIN_DIR}/xray" ]]; then
+    if [[ ! -x "${BIN_DIR}/xray" ]]; then
+      rollback_install
+      die "未找到本脚本的官方二进制 ${BIN_DIR}/xray，已恢复原算法。"
+    fi
+    if ! validate_config "${BIN_DIR}/xray" "$CONFIG_FILE"; then
+      rollback_install
+      die "新算法配置校验失败，已恢复原来的加密方式、密码和链接。"
+    fi
+  fi
+  write_link_file
+  if [[ $SANDBOX -eq 1 ]]; then
+    fix_permissions
+    echo
+    print_connection_card
+    echo
+    info "沙箱模式：已写入新算法的配置与客户端文件，未重启系统服务。"
+    info "请把入口 3x-ui / 客户端的加密方式同步为 ${METHOD}，密码、地址和端口保持不变。仅重新跑安装不会完成这次迁移。"
+    return 0
+  fi
+  fix_permissions
+  assert_runtime_access
+  restart_our_service_after_port_change
+  echo
+  print_connection_card
+  echo
+  info "更换加密方式完成：${old_method} -> ${METHOD}。密码、端口、地址和名称未改动。"
+  info "请同步入口 3x-ui 出站与客户端的加密方式为 ${METHOD}，否则路由会启用但仍无法认证。TCP 能通不等于算法已对齐。"
+}
+
 
 # ---------------------------------------------------------------------------
 # 只读查询
@@ -1865,7 +2024,19 @@ missing = [k for k, v in (
     ("password", password), ("address", address),
 ) if not v]
 if missing:
-    fail("身份文件缺少必要字段：%s。已中止，不会重置密码或改写文件。" % "、".join(missing))
+    fail("身份文件缺少必要字段：%s。已中止，不会重置密码、改写文件，也不会向公网查询或编造地址。" % "、".join(missing))
+
+def address_line(addr):
+    import ipaddress
+    raw=(addr or "").strip()
+    if not raw:
+        fail("身份文件中的服务器地址为空。已中止，不会向公网查询或编造地址。")
+    core=raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+    try:
+        ipaddress.ip_address(core)
+        return "服务器地址（IP）：%s" % raw
+    except ValueError:
+        return "服务器地址（域名）：%s" % raw
 
 config_warn = ""
 if os.path.isfile(config_path):
@@ -1924,29 +2095,34 @@ if active not in ("active",):
 
 lines = [
     "节点名称：%s" % remark,
-    "协议：Shadowsocks（原生 RAW，不套 TLS / WS / XHTTP）",
+    address_line(address),
+    "端口：%s" % port,
+    "密码：%s" % password,
+    "加密方式：%s" % method,
+    "协议：Shadowsocks",
+    "传输：RAW（普通 TCP 流；入站同时监听 TCP 与 UDP）",
+    "安全：无（未启用 TLS。这不等于未加密，流量由 Shadowsocks 自身加密。）",
+    "UDP over TCP（UoT）：关闭",
+    "完整分享链接：",
+    uri,
+    "（%s）" % uri_note,
+    "",
+    "说明：以上是本机落地参数。若前面还有中转，客户端应使用中转入口地址和端口；两者不是同一条链接。",
+    "说明：已监听原生 UDP，但不等于中转或客户端一定能走 UDP。TCP 能通也不等于加密方式已对齐。",
+]
+if config_warn:
+    lines.append("说明：%s" % config_warn)
+lines += [
+    "",
+    "服务状态：%s" % active_note,
+    "开机启用：%s" % enabled,
     "核心版本：%s" % core_ver,
     "脚本钉死官方版本：%s" % (state_ver or pin_ver),
     "安装脚本版本：%s" % script_ver,
     "安装目录：%s" % prefix,
     "系统服务：%s" % unit_name,
-    "服务状态：%s" % active_note,
-    "开机启用：%s" % enabled,
-    "加密方式：%s" % method,
-    "地址：%s" % address,
-    "端口：%s（同时监听 TCP 与 UDP）" % port,
     "监听：%s" % (listen or "（身份文件未记录）"),
     "入站 network：%s" % network,
-]
-if config_warn:
-    lines.append("说明：%s" % config_warn)
-lines += [
-    "说明：这是本机落地链接。若前面还有中转，客户端应使用中转入口地址和端口；两者不是同一条链接。",
-    "说明：已监听原生 UDP，但不等于中转或客户端一定能走 UDP。",
-    "",
-    "完整导入链接（含密码等凭据，仅供本机查看，请勿发到聊天或日志）：",
-    uri,
-    "（%s）" % uri_note,
 ]
 sys.stdout.write("\n".join(lines) + "\n")
 PYCODE
@@ -2014,6 +2190,7 @@ self_test() {
 
   info "测试加密方式白名单与 none/plain 拒绝…"
   [[ "$(canonical_method aes-128-gcm)" == "$METHOD_AES128" ]] || { err "aes-128-gcm 规范化失败"; rc=1; }
+  [[ "$(canonical_method aes-256-gcm)" == "$METHOD_AES256" ]] || { err "aes-256-gcm 规范化失败"; rc=1; }
   [[ "$(canonical_method chacha20-poly1305)" == "$METHOD_CHACHA" ]] || { err "chacha 别名失败"; rc=1; }
   [[ "$(canonical_method chacha20-ietf-poly1305)" == "$METHOD_CHACHA" ]] || { err "chacha ietf 失败"; rc=1; }
   [[ "$(canonical_method 2022-blake3-aes-128-gcm)" == "$METHOD_SS2022" ]] || { err "ss2022 规范化失败"; rc=1; }
@@ -2129,11 +2306,11 @@ pw=sys.argv[3]
 assert st["port"]==18443, st
 assert st["address"]=="38.127.180.103"
 assert st["remark"]=="美国落地1"
-assert st["method"]=="aes-128-gcm"
+assert st["method"]=="aes-256-gcm"
 assert st["password"]==pw and pw
 assert cfg["inbounds"][0]["port"]==18443
 assert cfg["inbounds"][0]["settings"]["password"]==pw
-assert cfg["inbounds"][0]["settings"]["method"]=="aes-128-gcm"
+assert cfg["inbounds"][0]["settings"]["method"]=="aes-256-gcm"
 print("首次安装生成密码后 state/config 完整写出")
 PY
       info "首次安装字段保留与写出通过"
@@ -2222,7 +2399,19 @@ PY
   fi
 
   if [[ -n "$official_bin" ]]; then
-    info "用官方内核校验生成的 SS 配置（aes-128-gcm 与 2022）…"
+    info "用官方内核校验生成的 SS 配置（aes-256-gcm、aes-128-gcm 与 2022）…"
+    PREFIX="${testdir}/cfg-aes256"
+    init_paths
+    mkdir -p "$ETC_DIR"
+    METHOD="$METHOD_AES256"
+    PASSWORD="$(generate_password "$METHOD")"
+    REMARK='cfg-aes256'
+    PORT='18443'
+    LISTEN='127.0.0.1'
+    SERVER_ADDRESS='127.0.0.1'
+    write_config
+    validate_config "$official_bin" "$CONFIG_FILE" || { err "aes-256-gcm 配置未通过 xray run -test"; rc=1; }
+
     PREFIX="${testdir}/cfg-aes"
     init_paths
     mkdir -p "$ETC_DIR"
@@ -2298,10 +2487,10 @@ PY
     rm -rf "$full_root"
     set +e
     full_out="$(
+      env -u SS_NODE_METHOD \
       SS_NODE_REMARK='美国落地1' \
       SS_NODE_PORT=18443 \
       SS_NODE_ADDRESS='38.127.180.103' \
-      SS_NODE_METHOD='aes-128-gcm' \
       SS_NODE_OPEN_PORT=no \
       SS_NODE_XRAY_BIN="$official_bin" \
       bash "$0" --yes --sandbox "${full_root}/prefix" 2>&1
@@ -2326,13 +2515,29 @@ cfg=json.load(open(sys.argv[2],encoding="utf-8"))
 assert st["port"]==18443
 assert st["address"]=="38.127.180.103"
 assert st["remark"]=="美国落地1"
-assert st["method"]=="aes-128-gcm"
+assert st["method"]=="aes-256-gcm", st
 assert st["password"]
 assert cfg["inbounds"][0]["port"]==18443
+assert cfg["inbounds"][0]["settings"]["method"]=="aes-256-gcm"
 assert cfg["inbounds"][0]["settings"]["password"]==st["password"]
-print("非交互首次安装 state/config 通过")
+print("非交互首次安装默认 aes-256-gcm 通过")
 PY
-      info "非交互首次安装通过"
+      pw_shown="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["password"])' "${full_root}/prefix/etc/state.json")"
+      if printf '%s\n' "$full_out" | grep -q "服务器地址（IP）：38.127.180.103" \
+        && printf '%s\n' "$full_out" | grep -q "端口：18443" \
+        && printf '%s\n' "$full_out" | grep -q "密码：${pw_shown}" \
+        && printf '%s\n' "$full_out" | grep -q "加密方式：aes-256-gcm" \
+        && printf '%s\n' "$full_out" | grep -q "协议：Shadowsocks" \
+        && printf '%s\n' "$full_out" | grep -q "传输：RAW" \
+        && printf '%s\n' "$full_out" | grep -q "安全：无" \
+        && printf '%s\n' "$full_out" | grep -q "UDP over TCP（UoT）：关闭" \
+        && printf '%s\n' "$full_out" | grep -q "完整分享链接："; then
+        info "非交互首次安装默认 aes-256-gcm 与第一屏参数通过"
+      else
+        err "首次安装成功输出未在第一屏完整列出连接参数"
+        printf '%s\n' "$full_out" >&2
+        rc=1
+      fi
     fi
 
     info "回归：默认端口非交互（不指定 SS_NODE_PORT，应为 443 或因占用而明确报错，不得写成空端口）…"
@@ -2341,6 +2546,7 @@ PY
     rm -rf "$def_root"
     set +e
     def_out="$(
+      env -u SS_NODE_METHOD \
       SS_NODE_REMARK='默认端口节点' \
       SS_NODE_ADDRESS='38.127.180.103' \
       SS_NODE_OPEN_PORT=no \
@@ -2355,6 +2561,7 @@ import json,sys
 st=json.load(open(sys.argv[1],encoding="utf-8"))
 assert st["port"]==443, st
 assert st["address"]=="38.127.180.103"
+assert st["method"]=="aes-256-gcm", st
 print("默认端口 443 非交互通过")
 PY
     elif printf '%s\n' "$def_out" | grep -Eq 'int\(\) with base 10|unbound variable'; then
@@ -2458,7 +2665,7 @@ while time.time() < deadline:
             send(b"\n")  # 回车使用默认 443
             sent["port"] = True
         elif sent["port"] and (not sent["method"]) and ("加密方式" in text):
-            send(b"\n")  # 回车使用默认 aes-128-gcm
+            send(b"\n")  # 回车使用默认 aes-256-gcm
             sent["method"] = True
         elif sent["method"] and (not sent["addr"]) and ("落地分享链接的地址" in text):
             # 默认地址由探测或提示给出；回车采用默认。再加一轮自定义端口测试在下面。
@@ -2505,7 +2712,7 @@ PY
 import json,sys
 st=json.load(open(sys.argv[1],encoding="utf-8"))
 assert st["remark"]=="美国落地交互"
-assert st["method"]=="aes-128-gcm"
+assert st["method"]=="aes-256-gcm"
 assert st["port"]==443
 assert st["password"]
 assert st["address"]
@@ -2591,7 +2798,7 @@ cfg=json.load(open(sys.argv[2],encoding="utf-8"))
 assert st["remark"]=="自定义端口节点"
 assert st["port"]==18445
 assert st["address"]=="38.127.180.103"
-assert st["method"]=="aes-128-gcm"
+assert st["method"]=="aes-256-gcm"
 assert st["password"]
 assert cfg["inbounds"][0]["port"]==18445
 print("交互自定义端口与落地地址写出通过")
@@ -2736,11 +2943,28 @@ PY
     rc=1
   else
     printf '%s\n' "$info_out" | grep -q "节点名称：信息查询节点" || { err "--info 缺少名称"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "服务器地址（IP）：198.51.100.20" || { err "--info 未单独列出 IP 地址"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "端口：443" || { err "--info 缺少端口"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "密码：InfoPass:word/测" || { err "--info 未明文显示密码"; rc=1; }
     printf '%s\n' "$info_out" | grep -q "加密方式：aes-128-gcm" || { err "--info 缺少加密方式"; rc=1; }
-    printf '%s\n' "$info_out" | grep -q "198.51.100.20" || { err "--info 缺少地址"; rc=1; }
-    printf '%s\n' "$info_out" | grep -q "443" || { err "--info 缺少端口"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "协议：Shadowsocks" || { err "--info 缺少协议"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "传输：RAW" || { err "--info 缺少传输 RAW"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "安全：无" || { err "--info 缺少安全：无"; rc=1; }
+    printf '%s\n' "$info_out" | grep -q "UDP over TCP（UoT）：关闭" || { err "--info 缺少 UoT 关闭"; rc=1; }
     printf '%s\n' "$info_out" | grep -Fq "$expect_uri" || { err "--info 缺少完整 URI"; rc=1; }
     printf '%s\n' "$info_out" | grep -q "v26.6.27" || { err "--info 缺少核心版本"; rc=1; }
+    # 第一屏字段必须先于路径/服务细节出现。
+    python3 -c "
+import sys
+t=sys.argv[1]
+keys=['服务器地址（IP）：198.51.100.20','端口：443','密码：InfoPass:word/测','加密方式：aes-128-gcm','协议：Shadowsocks','传输：RAW','安全：无','UDP over TCP（UoT）：关闭','完整分享链接：']
+pos=[t.find(k) for k in keys]
+assert all(p>=0 for p in pos), pos
+assert pos==sorted(pos), pos
+svc=t.find('安装目录：')
+assert svc==-1 or svc>pos[-1]
+print('info first-screen order ok')
+" "$info_out" || { err "--info 第一屏字段顺序不对"; rc=1; }
     if printf '%s\n' "$info_out" | grep -q 'REALITY_PRIVATE_KEY_SHOULD_NEVER_APPEAR'; then
       err "--info 输出了其他节点的秘密"
       rc=1
@@ -2757,6 +2981,276 @@ PY
   else
     info "--info 只读通过"
   fi
+
+  info "测试：--info 在地址为域名时标注域名，不把域名写成 IP…"
+  python3 - "$STATE_FILE" <<'PY'
+import json,sys
+p=sys.argv[1]
+st=json.load(open(p,encoding="utf-8"))
+st["address"]="landing.example.test"
+json.dump(st, open(p,"w"), ensure_ascii=False, indent=2)
+PY
+  local info_dom
+  set +e
+  info_dom="$(
+    PATH="${stubbin}:$PATH" \
+    SS_NODE_PREFIX="$info_root" \
+    SANDBOX=1 \
+    bash "$0" --info 2>&1
+  )"
+  local info_dom_rc=$?
+  set -e
+  python3 - "$STATE_FILE" <<'PY'
+import json,sys
+p=sys.argv[1]
+st=json.load(open(p,encoding="utf-8"))
+st["address"]="198.51.100.20"
+json.dump(st, open(p,"w"), ensure_ascii=False, indent=2)
+PY
+  if [[ $info_dom_rc -ne 0 ]]; then
+    err "--info 在合法域名地址时失败"
+    printf '%s\n' "$info_dom" >&2
+    rc=1
+  elif printf '%s\n' "$info_dom" | grep -q "服务器地址（域名）：landing.example.test"; then
+    if printf '%s\n' "$info_dom" | grep -q "服务器地址（IP）：landing.example.test"; then
+      err "--info 把域名误标成了 IP"
+      rc=1
+    else
+      info "--info 域名标注通过"
+    fi
+  else
+    err "--info 未把域名单独标为服务器地址（域名）"
+    printf '%s\n' "$info_dom" >&2
+    rc=1
+  fi
+
+  info "测试：--info 在地址为空时失败，不编造、不查公网…"
+  python3 - "$STATE_FILE" <<'PY'
+import json,sys
+p=sys.argv[1]
+st=json.load(open(p,encoding="utf-8"))
+st["address"]=""
+json.dump(st, open(p,"w"), ensure_ascii=False, indent=2)
+PY
+  local info_empty
+  set +e
+  info_empty="$(
+    PATH="${stubbin}:$PATH" \
+    SS_NODE_PREFIX="$info_root" \
+    SANDBOX=1 \
+    bash "$0" --info 2>&1
+  )"
+  local info_empty_rc=$?
+  set -e
+  python3 - "$STATE_FILE" <<'PY'
+import json,sys
+p=sys.argv[1]
+st=json.load(open(p,encoding="utf-8"))
+st["address"]="198.51.100.20"
+json.dump(st, open(p,"w"), ensure_ascii=False, indent=2)
+PY
+  if [[ $info_empty_rc -eq 0 ]]; then
+    err "--info 在地址为空时不应成功"
+    printf '%s\n' "$info_empty" >&2
+    rc=1
+  elif printf '%s\n' "$info_empty" | grep -Eq 'ifconfig|ipify|icanhazip|api.ip|公网IP'; then
+    err "--info 空地址时疑似查询了公网地址"
+    printf '%s\n' "$info_empty" >&2
+    rc=1
+  elif printf '%s\n' "$info_empty" | grep -Eq '缺少必要字段：address|服务器地址为空'; then
+    info "--info 空地址失败且未编造地址"
+  else
+    err "--info 空地址失败原因不明确，可能不是地址校验"
+    printf '%s\n' "$info_empty" >&2
+    rc=1
+  fi
+
+  info "测试：--change-method 在传统 AEAD 之间迁移并保留密码/端口/地址/名称…"
+  local mig_root mig_prefix mig_pass='KeepPw:word/测-128'
+  mig_root="${testdir}/change-method"
+  mig_prefix="${mig_root}/prefix"
+  rm -rf "$mig_root"
+  mkdir -p "${mig_prefix}/etc" "${mig_prefix}/bin"
+  if [[ -n "${official_bin:-}" && -x "$official_bin" ]]; then
+    cp -a "$official_bin" "${mig_prefix}/bin/xray"
+    chmod 755 "${mig_prefix}/bin/xray"
+  fi
+  PREFIX="$mig_prefix"
+  init_paths
+  METHOD="$METHOD_AES128"
+  PASSWORD="$mig_pass"
+  PORT='7788'
+  LISTEN='0.0.0.0'
+  SERVER_ADDRESS='38.127.180.103'
+  REMARK='美国落地1'
+  write_config
+  write_state
+  write_link_file
+  local mig_out
+  set +e
+  mig_out="$(bash "$0" --yes --change-method aes-256-gcm --sandbox "$PREFIX" 2>&1)"
+  local mig_rc=$?
+  set -e
+  if [[ $mig_rc -ne 0 ]]; then
+    err "--change-method aes-256-gcm 失败"
+    printf '%s\n' "$mig_out" >&2
+    rc=1
+  else
+    python3 - "$STATE_FILE" "$CONFIG_FILE" "$mig_pass" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+cfg=json.load(open(sys.argv[2],encoding="utf-8"))
+pw=sys.argv[3]
+assert st["method"]=="aes-256-gcm", st
+assert st["password"]==pw, "password changed"
+assert st["port"]==7788
+assert st["address"]=="38.127.180.103"
+assert st["remark"]=="美国落地1"
+assert cfg["inbounds"][0]["settings"]["method"]=="aes-256-gcm"
+assert cfg["inbounds"][0]["settings"]["password"]==pw
+assert cfg["inbounds"][0]["port"]==7788
+print("change-method preserve ok")
+PY
+    if printf '%s\n' "$mig_out" | grep -q "加密方式：aes-256-gcm" \
+      && printf '%s\n' "$mig_out" | grep -q "服务器地址（IP）：38.127.180.103" \
+      && printf '%s\n' "$mig_out" | grep -q "密码：${mig_pass}" \
+      && printf '%s\n' "$mig_out" | grep -q "端口：7788"; then
+      info "--change-method 128→256 保留字段通过"
+    else
+      err "--change-method 成功输出未完整列出新参数"
+      printf '%s\n' "$mig_out" >&2
+      rc=1
+    fi
+  fi
+
+  info "测试：重跑安装不会自动把已有 aes-128-gcm 改成默认 aes-256-gcm…"
+  local keep_root keep_prefix
+  keep_root="${testdir}/rerun-keep-method"
+  keep_prefix="${keep_root}/prefix"
+  rm -rf "$keep_root"
+  mkdir -p "${keep_prefix}/etc" "${keep_prefix}/bin"
+  if [[ -n "${official_bin:-}" && -x "$official_bin" ]]; then
+    cp -a "$official_bin" "${keep_prefix}/bin/xray"
+    chmod 755 "${keep_prefix}/bin/xray"
+  fi
+  PREFIX="$keep_prefix"
+  init_paths
+  METHOD="$METHOD_AES128"
+  PASSWORD='KeepRerun:pw/测-128to256'
+  PORT='7788'
+  LISTEN='0.0.0.0'
+  SERVER_ADDRESS='38.127.180.103'
+  REMARK='美国落地1'
+  write_config
+  write_state
+  write_link_file
+  local rerun_out
+  set +e
+  rerun_out="$(
+    env -u SS_NODE_METHOD \
+      SS_NODE_OPEN_PORT=no \
+      SS_NODE_XRAY_BIN="${keep_prefix}/bin/xray" \
+      bash "$0" --yes --sandbox "$PREFIX" 2>&1
+  )"
+  local rerun_rc=$?
+  set -e
+  if [[ $rerun_rc -ne 0 ]]; then
+    err "重跑已有安装失败"
+    printf '%s\n' "$rerun_out" >&2
+    rc=1
+  else
+    python3 - "$STATE_FILE" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+assert st["method"]=="aes-128-gcm", st
+assert st["password"]=="KeepRerun:pw/测-128to256"
+assert st["port"]==7788
+print("rerun keeps method ok")
+PY
+    if printf '%s\n' "$rerun_out" | grep -Eq '不会改算法|不会自动改成默认|--change-method'; then
+      info "重跑保留原算法并提示需显式迁移"
+    else
+      err "重跑已有安装未提示仅下载重跑不会迁移算法"
+      printf '%s\n' "$rerun_out" >&2
+      rc=1
+    fi
+  fi
+
+  info "测试：--change-method 拒绝传统 AEAD 与 2022 互转…"
+  local refuse_out
+  set +e
+  refuse_out="$(bash "$0" --yes --change-method 2022-blake3-aes-128-gcm --sandbox "$PREFIX" 2>&1)"
+  local refuse_rc=$?
+  set -e
+  python3 - "$STATE_FILE" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+assert st["method"]=="aes-128-gcm", st
+assert st["password"]=="KeepRerun:pw/测-128to256"
+print("2022 refuse left identity intact")
+PY
+  if [[ $refuse_rc -eq 0 ]]; then
+    err "--change-method 不应允许 aes-128-gcm 改到 2022"
+    printf '%s\n' "$refuse_out" >&2
+    rc=1
+  elif printf '%s\n' "$refuse_out" | grep -Eqi '不兼容|不能|无法|拒绝'; then
+    info "--change-method 拒绝 2022 通过"
+  else
+    err "--change-method 拒绝 2022 时未明确说明不兼容"
+    printf '%s\n' "$refuse_out" >&2
+    rc=1
+  fi
+
+  info "测试：--change-method 校验失败时回滚密码与算法…"
+  local rb_root rb_prefix
+  rb_root="${testdir}/change-method-rollback"
+  rb_prefix="${rb_root}/prefix"
+  rm -rf "$rb_root"
+  mkdir -p "${rb_prefix}/etc" "${rb_prefix}/bin"
+  PREFIX="$rb_prefix"
+  init_paths
+  METHOD="$METHOD_AES128"
+  PASSWORD='KeepRollback:pw/测'
+  PORT='7788'
+  LISTEN='0.0.0.0'
+  SERVER_ADDRESS='38.127.180.103'
+  REMARK='美国落地1'
+  write_config
+  write_state
+  write_link_file
+  # 放入会立即失败的假 xray，使 validate_config 失败并触发回滚。
+  cat > "${rb_prefix}/bin/xray" <<'STUB'
+#!/bin/sh
+echo "stub xray refusing config" >&2
+exit 2
+STUB
+  chmod 755 "${rb_prefix}/bin/xray"
+  local rb_out
+  set +e
+  rb_out="$(bash "$0" --yes --change-method aes-256-gcm --sandbox "$PREFIX" 2>&1)"
+  local rb_rc=$?
+  set -e
+  python3 - "$STATE_FILE" "$CONFIG_FILE" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+cfg=json.load(open(sys.argv[2],encoding="utf-8"))
+assert st["method"]=="aes-128-gcm", st
+assert st["password"]=="KeepRollback:pw/测"
+assert st["port"]==7788
+assert st["address"]=="38.127.180.103"
+assert st["remark"]=="美国落地1"
+assert cfg["inbounds"][0]["settings"]["method"]=="aes-128-gcm"
+assert cfg["inbounds"][0]["settings"]["password"]=="KeepRollback:pw/测"
+print("change-method rollback ok")
+PY
+  if [[ $rb_rc -eq 0 ]]; then
+    err "校验失败时 --change-method 不应报告成功"
+    printf '%s\n' "$rb_out" >&2
+    rc=1
+  else
+    info "--change-method 失败回滚通过"
+  fi
+
 
   info "测试与 XHTTP 共存时的端口冲突（只报错，不杀服务、不写入对方目录）…"
   local mockdir stubss xhttp_mark
@@ -2885,9 +3379,10 @@ PY
 }
 
 main() {
-  local arg do_change=0
+  local arg do_change=0 do_change_method=0
   REQUESTED_PORT="${REQUESTED_PORT:-}"
-  # 先分派 --info / --change-port / --self-test，不进入完整安装。
+  REQUESTED_METHOD="${REQUESTED_METHOD:-}"
+  # 先分派 --info / --change-port / --change-method / --self-test，不进入完整安装。
   for arg in "$@"; do
     if [[ "$arg" == "--info" ]]; then
       if [[ $# -ne 1 ]]; then
@@ -2931,13 +3426,26 @@ main() {
           shift
         fi
         ;;
+      --change-method)
+        do_change_method=1
+        shift
+        if [[ $# -gt 0 && "$1" != --* ]]; then
+          REQUESTED_METHOD="$1"
+          shift
+        fi
+        ;;
       *)
         die "未知参数：$1。使用 --help 查看说明。"
         ;;
     esac
   done
+  if [[ $do_change -eq 1 && $do_change_method -eq 1 ]]; then
+    die "--change-port 与 --change-method 请分别运行，不要写在同一条命令里。"
+  fi
   if [[ $do_change -eq 1 ]]; then
     run_change_port
+  elif [[ $do_change_method -eq 1 ]]; then
+    run_change_method
   else
     run_install
   fi
