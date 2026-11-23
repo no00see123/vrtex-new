@@ -46,6 +46,22 @@ proxy-groups:
       - "🚀 手动切换"
       - "REJECT"
 
+  # 普通代理：排除 myself 节点，避免普通流量弄脏 AI 节点的 IP。
+  - name: "🚀 节点选择"
+    type: select
+    include-all: true
+
+  # AI 专用：列出全部真实节点，手动选干净的那个，不含 DIRECT。
+  - name: "🚀 手动切换"
+    type: select
+    include-all: true
+
+  - name: "♊ Gemini"
+    type: select
+    proxies:
+      - "🚀 手动切换"
+      - "REJECT"
+
   - name: "🤖 ChatGPT"
     type: select
     proxies:
@@ -57,22 +73,6 @@ proxy-groups:
     proxies:
       - "🚀 手动切换"
       - "REJECT"
-
-  - name: "♊ Gemini"
-    type: select
-    proxies:
-      - "🚀 手动切换"
-      - "REJECT"
-
-  # 普通代理：排除 myself 节点，避免普通流量弄脏 AI 节点的 IP。
-  - name: "🚀 节点选择"
-    type: select
-    include-all: true
-
-  # AI 专用：列出全部真实节点，手动选干净的那个，不含 DIRECT。
-  - name: "🚀 手动切换"
-    type: select
-    include-all: true
 
   - name: "🧱 DNS防泄露"
     type: select
