@@ -21,7 +21,7 @@ readonly PINNED_SHA256_BIN_LINUX_64='8ef87ac07f95617e094b8e9302ea3e0c2d0edaa7045
 readonly PINNED_SHA256_BIN_LINUX_ARM64='53ad04b1ddcba6f4ff8834b3db2e9a596456441259cea3e4f03f86cd39e22884'
 
 readonly SCRIPT_NAME='install-ss-node.sh'
-readonly SCRIPT_VERSION='1.0.0'
+readonly SCRIPT_VERSION='1.0.1'
 readonly UNIT_NAME='ss-node.service'
 readonly DEFAULT_PREFIX='/opt/ss-node'
 readonly SYSUSER='ss-node'
@@ -79,6 +79,7 @@ PREV_UNIT_ENABLED=''
 PREV_UNIT_ACTIVE=''
 NEW_UNIT_WRITTEN=0
 SERVICE_STARTED_THIS_RUN=0
+SS_TMP_WORK=''
 
 # ---------------------------------------------------------------------------
 # 日志（默认不打印密码或完整分享链接；终端按需输出除外）
@@ -876,11 +877,14 @@ write_state() {
   python3 - "$STATE_FILE" <<'PY'
 import json,os,sys
 path=sys.argv[1]
+port_raw=os.environ.get("SS_STATE_PORT","")
+if not port_raw or not port_raw.isdigit():
+    raise SystemExit("写入身份文件失败：端口无效或为空（%r）。" % port_raw)
 data={
   "version": os.environ["SS_STATE_VERSION"],
   "script_version": os.environ.get("SS_STATE_SCRIPT_VERSION","1.0.0"),
   "remark": os.environ["SS_STATE_REMARK"],
-  "port": int(os.environ["SS_STATE_PORT"]),
+  "port": int(port_raw),
   "method": os.environ["SS_STATE_METHOD"],
   "password": os.environ["SS_STATE_PASSWORD"],
   "listen": os.environ["SS_STATE_LISTEN"],
@@ -1407,24 +1411,27 @@ prompt_share_address() {
 }
 
 load_saved_identity() {
-  REMARK=''
-  PORT=''
-  METHOD=''
-  PASSWORD=''
-  LISTEN=''
-  SERVER_ADDRESS=''
+  # 仅在确认已有完整身份后再写入全局变量。首次安装时若先清空 PORT 等字段，
+  # 会丢掉 prompt_inputs 已采集的端口/名称/算法/地址，导致随后 write_state 对空端口 int('') 失败。
   if ! our_install_exists; then
     return 1
   fi
-  REMARK="$(json_get "$STATE_FILE" remark)"
-  PORT="$(json_get "$STATE_FILE" port)"
-  METHOD="$(json_get "$STATE_FILE" method)"
-  PASSWORD="$(json_get "$STATE_FILE" password)"
-  LISTEN="$(json_get "$STATE_FILE" listen)"
-  SERVER_ADDRESS="$(json_get "$STATE_FILE" address)"
-  [[ -n "$REMARK" && -n "$PORT" && -n "$METHOD" && -n "$PASSWORD" ]] || die "已有 state.json 不完整，已中止以免覆盖密码。请人工检查 ${STATE_FILE}。"
-  METHOD="$(canonical_method "$METHOD")" || die "已保存的加密方式不受支持，已中止，不会覆盖密码。"
-  validate_password_for_method "$METHOD" "$PASSWORD" || die "已保存的密码与加密方式不匹配，已中止，不会重新生成并覆盖。"
+  local remark port method password listen address
+  remark="$(json_get "$STATE_FILE" remark)"
+  port="$(json_get "$STATE_FILE" port)"
+  method="$(json_get "$STATE_FILE" method)"
+  password="$(json_get "$STATE_FILE" password)"
+  listen="$(json_get "$STATE_FILE" listen)"
+  address="$(json_get "$STATE_FILE" address)"
+  [[ -n "$remark" && -n "$port" && -n "$method" && -n "$password" ]] || die "已有 state.json 不完整，已中止以免覆盖密码。请人工检查 ${STATE_FILE}。"
+  method="$(canonical_method "$method")" || die "已保存的加密方式不受支持，已中止，不会覆盖密码。"
+  validate_password_for_method "$method" "$password" || die "已保存的密码与加密方式不匹配，已中止，不会重新生成并覆盖。"
+  REMARK="$remark"
+  PORT="$port"
+  METHOD="$method"
+  PASSWORD="$password"
+  LISTEN="$listen"
+  SERVER_ADDRESS="$address"
   return 0
 }
 
@@ -1558,6 +1565,10 @@ EOF
 }
 
 save_identity_files() {
+  if [[ -z "${REMARK:-}" || -z "${PORT:-}" || -z "${METHOD:-}" || -z "${PASSWORD:-}" || -z "${LISTEN:-}" || -z "${SERVER_ADDRESS:-}" ]]; then
+    die "内部错误：写入配置前缺少名称、端口、加密方式、密码、监听或地址（端口=${PORT:-空}）。已中止，以免写出坏配置或覆盖已有身份。"
+  fi
+  valid_port "$PORT" || die "内部错误：写入配置前端口无效：${PORT:-空}"
   mkdir -p "$ETC_DIR"
   chmod 0750 "$ETC_DIR"
   write_state
@@ -1566,6 +1577,15 @@ save_identity_files() {
 
 print_udp_caveat() {
   info "本节点会在同一端口同时监听原生 SS 的 TCP 与 UDP。这不等于只开 TCP 就能转发 UDP：UDP 还需要中转和客户端全链支持原生 SS UDP。许多仅做 TCP 四层转发的中转无法传递 UDP。"
+}
+
+# 使用全局目录变量，避免 EXIT 陷阱在函数返回、local 变量已释放后触发 set -u。
+cleanup_install_tmp() {
+  local dir="${SS_TMP_WORK:-}"
+  SS_TMP_WORK=''
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    rm -rf "$dir"
+  fi
 }
 
 run_install() {
@@ -1585,12 +1605,12 @@ run_install() {
   choose_listen
   [[ -n "$LISTEN" ]] || choose_listen
 
-  local work bin
-  work="$(mktemp -d "${TMPDIR:-/tmp}/ss-node-work.XXXXXX")"
-  cleanup_tmp() { rm -rf "$work"; }
-  trap 'cleanup_tmp' EXIT
+  local bin
+  cleanup_install_tmp
+  SS_TMP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/ss-node-work.XXXXXX")"
+  trap 'cleanup_install_tmp' EXIT
 
-  bin="$(obtain_verified_binary "$work")"
+  bin="$(obtain_verified_binary "$SS_TMP_WORK")"
   load_or_create_identity
 
   mkdir -p "$ETC_DIR"
@@ -1608,7 +1628,7 @@ run_install() {
     print_udp_caveat
     info "沙箱/跳过 systemd 模式已完成。配置在 ${CONFIG_FILE}，链接在 ${LINK_FILE}。未安装系统服务，未开端口，未改防火墙。"
     trap - EXIT
-    cleanup_tmp
+    cleanup_install_tmp
     return 0
   fi
 
@@ -1625,7 +1645,7 @@ run_install() {
   info "分享链接文件：${LINK_FILE}"
   info "云厂商安全组 / 网络 ACL 需要你自行放行 ${PORT}/tcp 与 ${PORT}/udp。本脚本无法代为修改。若经中转，请同步中转后端映射。"
   trap - EXIT
-  cleanup_tmp
+  cleanup_install_tmp
 }
 
 require_ss_installed() {
@@ -1784,7 +1804,7 @@ run_info() {
       die "无法读取 ${STATE_FILE}。查看节点信息请使用：sudo bash ${SCRIPT_NAME} --info。本命令只查询，不会因此重新安装或重置密码。"
     fi
     if [[ ! -e "$STATE_FILE" ]]; then
-      die "找不到身份文件 ${STATE_FILE}。不会自动重新生成密码。若确认曾安装，请检查该文件是否被移动或损坏。"
+      die "找不到身份文件 ${STATE_FILE}。不会自动重新生成密码。若 1.0.0 首次安装在写入身份前失败，目录里可能只有空的 etc；请用 1.0.1 或更新脚本重新运行安装（不必删除目录）。若确认曾安装成功，请检查该文件是否被移动或损坏。"
     fi
     die "无法读取身份文件 ${STATE_FILE}。已中止，不会重置密码或改写文件。"
   fi
@@ -2077,6 +2097,87 @@ PY
     rc=1
   fi
 
+  info "回归：首次安装在生成密码后不得清空已采集的端口/名称/地址（1.0.0 缺陷）…"
+  PREFIX="${testdir}/first-install-keep"
+  init_paths
+  rm -rf "$PREFIX"
+  mkdir -p "$ETC_DIR" "$BIN_DIR" "$LOG_DIR"
+  # 模拟 prompt_inputs 已完成、尚无 state.json（与用户首次安装同一顺序）
+  REMARK='美国落地1'
+  PORT='18443'
+  METHOD="$DEFAULT_METHOD"
+  LISTEN='0.0.0.0'
+  SERVER_ADDRESS='38.127.180.103'
+  PASSWORD=''
+  if our_install_exists; then
+    err "回归前置条件失败：不应已有身份文件"
+    rc=1
+  else
+    load_or_create_identity || { err "load_or_create_identity 失败"; rc=1; }
+    if [[ "$PORT" != "18443" || "$REMARK" != "美国落地1" || "$METHOD" != "$DEFAULT_METHOD" || "$SERVER_ADDRESS" != "38.127.180.103" || -z "$PASSWORD" ]]; then
+      err "生成密码后丢失了已采集字段：port=${PORT:-空} remark=${REMARK:-空} method=${METHOD:-空} addr=${SERVER_ADDRESS:-空} password_empty=$([[ -z ${PASSWORD:-} ]] && echo yes || echo no)"
+      rc=1
+    elif ! save_identity_files; then
+      err "生成密码后写入 state/config 失败"
+      rc=1
+    else
+      python3 - "$STATE_FILE" "$CONFIG_FILE" "$PASSWORD" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+cfg=json.load(open(sys.argv[2],encoding="utf-8"))
+pw=sys.argv[3]
+assert st["port"]==18443, st
+assert st["address"]=="38.127.180.103"
+assert st["remark"]=="美国落地1"
+assert st["method"]=="aes-128-gcm"
+assert st["password"]==pw and pw
+assert cfg["inbounds"][0]["port"]==18443
+assert cfg["inbounds"][0]["settings"]["password"]==pw
+assert cfg["inbounds"][0]["settings"]["method"]=="aes-128-gcm"
+print("首次安装生成密码后 state/config 完整写出")
+PY
+      info "首次安装字段保留与写出通过"
+    fi
+  fi
+
+  info "回归：EXIT 陷阱在函数失败返回后不得因 local 工作目录触发 nounset…"
+  local trap_out trap_rc trap_dir
+  trap_dir="$(mktemp -d "${testdir}/trap-work.XXXXXX")"
+  set +e
+  trap_out="$(
+    SS_TMP_WORK="$trap_dir" bash -c '
+      set -euo pipefail
+      SS_TMP_WORK="$1"
+      cleanup_install_tmp() {
+        local dir="${SS_TMP_WORK:-}"
+        SS_TMP_WORK=""
+        if [[ -n "$dir" && -d "$dir" ]]; then
+          rm -rf "$dir"
+        fi
+      }
+      run_like() {
+        local bin
+        trap "cleanup_install_tmp" EXIT
+        false
+      }
+      run_like
+    ' _ "$trap_dir" 2>&1
+  )"
+  trap_rc=$?
+  set -e
+  if printf '%s\n' "$trap_out" | grep -q 'unbound variable'; then
+    err "陷阱清理在函数返回后仍出现 unbound variable：$trap_out"
+    rc=1
+  elif [[ -d "$trap_dir" ]]; then
+    err "陷阱清理未删除临时目录"
+    rc=1
+  elif [[ $trap_rc -eq 0 ]]; then
+    err "陷阱测试中的失败路径未以非零状态返回"
+    rc=1
+  else
+    info "陷阱清理在函数失败返回后未触发 nounset"
+  fi
+
   info "准备官方 ${XRAY_VERSION} 真实二进制并校验哈希…"
   detect_asset
   local official_bin="" official_zip=""
@@ -2190,6 +2291,312 @@ PY
       fi
     fi
     info "二进制复用与来源只读通过"
+
+    info "回归：完整沙箱首次安装（非交互、自定义端口、落地地址 38.127.180.103）须写出 state/config，且不操作本机 /opt 或 systemd…"
+    local full_root full_out full_rc half_root pw_keep
+    full_root="${testdir}/full-first"
+    rm -rf "$full_root"
+    set +e
+    full_out="$(
+      SS_NODE_REMARK='美国落地1' \
+      SS_NODE_PORT=18443 \
+      SS_NODE_ADDRESS='38.127.180.103' \
+      SS_NODE_METHOD='aes-128-gcm' \
+      SS_NODE_OPEN_PORT=no \
+      SS_NODE_XRAY_BIN="$official_bin" \
+      bash "$0" --yes --sandbox "${full_root}/prefix" 2>&1
+    )"
+    full_rc=$?
+    set -e
+    if [[ $full_rc -ne 0 ]]; then
+      err "非交互沙箱首次安装失败（exit ${full_rc}）："
+      printf '%s\n' "$full_out" >&2
+      rc=1
+    elif printf '%s\n' "$full_out" | grep -q 'unbound variable'; then
+      err "非交互安装出现 unbound variable"
+      rc=1
+    elif [[ ! -s "${full_root}/prefix/etc/state.json" || ! -s "${full_root}/prefix/etc/config.json" ]]; then
+      err "非交互安装未写出 state/config"
+      rc=1
+    else
+      python3 - "${full_root}/prefix/etc/state.json" "${full_root}/prefix/etc/config.json" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+cfg=json.load(open(sys.argv[2],encoding="utf-8"))
+assert st["port"]==18443
+assert st["address"]=="38.127.180.103"
+assert st["remark"]=="美国落地1"
+assert st["method"]=="aes-128-gcm"
+assert st["password"]
+assert cfg["inbounds"][0]["port"]==18443
+assert cfg["inbounds"][0]["settings"]["password"]==st["password"]
+print("非交互首次安装 state/config 通过")
+PY
+      info "非交互首次安装通过"
+    fi
+
+    info "回归：默认端口非交互（不指定 SS_NODE_PORT，应为 443 或因占用而明确报错，不得写成空端口）…"
+    local def_root def_out def_rc
+    def_root="${testdir}/full-default-port"
+    rm -rf "$def_root"
+    set +e
+    def_out="$(
+      SS_NODE_REMARK='默认端口节点' \
+      SS_NODE_ADDRESS='38.127.180.103' \
+      SS_NODE_OPEN_PORT=no \
+      SS_NODE_XRAY_BIN="$official_bin" \
+      bash "$0" --yes --sandbox "${def_root}/prefix" 2>&1
+    )"
+    def_rc=$?
+    set -e
+    if [[ $def_rc -eq 0 ]]; then
+      python3 - "${def_root}/prefix/etc/state.json" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+assert st["port"]==443, st
+assert st["address"]=="38.127.180.103"
+print("默认端口 443 非交互通过")
+PY
+    elif printf '%s\n' "$def_out" | grep -Eq 'int\(\) with base 10|unbound variable'; then
+      err "默认端口安装出现 1.0.0 同类故障：$def_out"
+      rc=1
+    elif printf '%s\n' "$def_out" | grep -q '无法同时用于本 SS 节点'; then
+      info "默认 443 已被占用，脚本正确拒绝而未写出空端口"
+    else
+      err "默认端口非交互安装失败：$def_out"
+      rc=1
+    fi
+
+    info "回归：半安装残留（仅有空 etc、无 state）重跑不必删除目录…"
+    half_root="${testdir}/half-install"
+    rm -rf "$half_root"
+    mkdir -p "${half_root}/prefix/etc/.rollback.1"
+    set +e
+    full_out="$(
+      SS_NODE_REMARK='半安装重跑' \
+      SS_NODE_PORT=18444 \
+      SS_NODE_ADDRESS='38.127.180.103' \
+      SS_NODE_OPEN_PORT=no \
+      SS_NODE_XRAY_BIN="$official_bin" \
+      bash "$0" --yes --sandbox "${half_root}/prefix" 2>&1
+    )"
+    full_rc=$?
+    set -e
+    if [[ $full_rc -ne 0 || ! -s "${half_root}/prefix/etc/state.json" ]]; then
+      err "半安装目录重跑失败（不必删目录）：$full_out"
+      rc=1
+    else
+      pw_keep="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8"))["password"])' "${half_root}/prefix/etc/state.json")"
+      set +e
+      full_out="$(
+        SS_NODE_REMARK='半安装重跑' \
+        SS_NODE_PORT=18444 \
+        SS_NODE_ADDRESS='38.127.180.103' \
+        SS_NODE_OPEN_PORT=no \
+        SS_NODE_XRAY_BIN="$official_bin" \
+        bash "$0" --yes --sandbox "${half_root}/prefix" 2>&1
+      )"
+      full_rc=$?
+      set -e
+      if [[ $full_rc -ne 0 ]]; then
+        err "已有身份后再次重跑失败：$full_out"
+        rc=1
+      else
+        python3 - "${half_root}/prefix/etc/state.json" "$pw_keep" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+assert st["password"]==sys.argv[2], "重跑改变了密码"
+assert st["port"]==18444
+print("半安装重跑并保留已有密码通过")
+PY
+      fi
+    fi
+
+    info "回归：交互安装（PTY，回车采用默认端口与默认落地地址，不绕过 prompt_inputs）…"
+    local pty_root pty_rc
+    pty_root="${testdir}/pty-interactive"
+    rm -rf "$pty_root"
+    set +e
+    SS_NODE_OPEN_PORT=no SS_NODE_XRAY_BIN="$official_bin" python3 - "$0" "${pty_root}/prefix" "$official_bin" <<'PY'
+import os, pty, sys, time, select, errno
+script, prefix, official = sys.argv[1], sys.argv[2], sys.argv[3]
+env = os.environ.copy()
+env["SS_NODE_OPEN_PORT"] = "no"
+env["SS_NODE_XRAY_BIN"] = official
+# 不设置 REMARK/PORT/ADDRESS/METHOD，必须走交互
+for k in ("SS_NODE_REMARK", "SS_NODE_NAME", "SS_NODE_PORT", "SS_NODE_ADDRESS", "SS_NODE_METHOD"):
+    env.pop(k, None)
+
+sent = {"name": False, "port": False, "method": False, "addr": False}
+buf = b""
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve("/bin/bash", ["bash", script, "--sandbox", prefix], env)
+
+def send(data):
+    os.write(fd, data)
+
+deadline = time.time() + 90
+status = 0
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 1)
+    if fd in r:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError as e:
+            if e.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        buf += chunk
+        text = buf.decode("utf-8", "replace")
+        if (not sent["name"]) and ("节点名称" in text):
+            send("美国落地交互\n".encode())
+            sent["name"] = True
+        elif sent["name"] and (not sent["port"]) and ("监听端口" in text):
+            send(b"\n")  # 回车使用默认 443
+            sent["port"] = True
+        elif sent["port"] and (not sent["method"]) and ("加密方式" in text):
+            send(b"\n")  # 回车使用默认 aes-128-gcm
+            sent["method"] = True
+        elif sent["method"] and (not sent["addr"]) and ("落地分享链接的地址" in text):
+            # 默认地址由探测或提示给出；回车采用默认。再加一轮自定义端口测试在下面。
+            send(b"\n")
+            sent["addr"] = True
+    else:
+        # 子进程可能已退出
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid != 0:
+            break
+else:
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+    os.waitpid(pid, 0)
+    sys.stderr.write("交互安装超时\n")
+    sys.stderr.write(buf.decode("utf-8", "replace"))
+    sys.exit(2)
+
+if os.waitpid(pid, os.WNOHANG)[0] == 0:
+    _, status = os.waitpid(pid, 0)
+code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+open(prefix + ".pty.log", "w", encoding="utf-8").write(buf.decode("utf-8", "replace"))
+sys.exit(code)
+PY
+    pty_rc=$?
+    set -e
+    if [[ $pty_rc -ne 0 ]]; then
+      err "交互 PTY 安装失败（exit ${pty_rc}）。日志："
+      cat "${pty_root}/prefix.pty.log" 2>/dev/null >&2 || true
+      # 443 被占用时允许明确报错，但不得是空端口/unbound
+      if [[ -f "${pty_root}/prefix.pty.log" ]] && grep -q '无法同时用于本 SS 节点' "${pty_root}/prefix.pty.log"; then
+        info "交互默认 443 被占用，改为再测自定义端口回车路径"
+        pty_rc=0
+      elif [[ -f "${pty_root}/prefix.pty.log" ]] && grep -Eq 'int\(\) with base 10|unbound variable' "${pty_root}/prefix.pty.log"; then
+        rc=1
+      else
+        rc=1
+      fi
+    fi
+    if [[ $pty_rc -eq 0 && -s "${pty_root}/prefix/etc/state.json" ]]; then
+      python3 - "${pty_root}/prefix/etc/state.json" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+assert st["remark"]=="美国落地交互"
+assert st["method"]=="aes-128-gcm"
+assert st["port"]==443
+assert st["password"]
+assert st["address"]
+print("交互回车默认端口/算法写出通过，地址=%s" % st["address"])
+PY
+    fi
+
+    info "回归：交互安装自定义端口与指定落地地址（PTY，不绕过 prompt_inputs）…"
+    local pty2="${testdir}/pty-custom"
+    rm -rf "$pty2"
+    set +e
+    SS_NODE_OPEN_PORT=no SS_NODE_XRAY_BIN="$official_bin" python3 - "$0" "${pty2}/prefix" "$official_bin" <<'PY'
+import os, pty, sys, time, select, errno
+script, prefix, official = sys.argv[1], sys.argv[2], sys.argv[3]
+env = os.environ.copy()
+env["SS_NODE_OPEN_PORT"] = "no"
+env["SS_NODE_XRAY_BIN"] = official
+for k in ("SS_NODE_REMARK", "SS_NODE_NAME", "SS_NODE_PORT", "SS_NODE_ADDRESS", "SS_NODE_METHOD"):
+    env.pop(k, None)
+sent = {"name": False, "port": False, "method": False, "addr": False}
+buf = b""
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve("/bin/bash", ["bash", script, "--sandbox", prefix], env)
+
+deadline = time.time() + 90
+status = 0
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 1)
+    if fd in r:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError as e:
+            if e.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        buf += chunk
+        text = buf.decode("utf-8", "replace")
+        if (not sent["name"]) and ("节点名称" in text):
+            os.write(fd, "自定义端口节点\n".encode())
+            sent["name"] = True
+        elif sent["name"] and (not sent["port"]) and ("监听端口" in text):
+            os.write(fd, b"18445\n")
+            sent["port"] = True
+        elif sent["port"] and (not sent["method"]) and ("加密方式" in text):
+            os.write(fd, b"\n")
+            sent["method"] = True
+        elif sent["method"] and (not sent["addr"]) and ("落地分享链接的地址" in text):
+            os.write(fd, b"38.127.180.103\n")
+            sent["addr"] = True
+    else:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid != 0:
+            break
+else:
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+    os.waitpid(pid, 0)
+    sys.stderr.write("自定义端口交互安装超时\n")
+    sys.stderr.write(buf.decode("utf-8", "replace"))
+    sys.exit(2)
+if os.waitpid(pid, os.WNOHANG)[0] == 0:
+    _, status = os.waitpid(pid, 0)
+code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+open(prefix + ".pty.log", "w", encoding="utf-8").write(buf.decode("utf-8", "replace"))
+sys.exit(code)
+PY
+    pty_rc=$?
+    set -e
+    if [[ $pty_rc -ne 0 ]]; then
+      err "自定义端口交互安装失败（exit ${pty_rc}）："
+      cat "${pty2}/prefix.pty.log" 2>/dev/null >&2 || true
+      rc=1
+    else
+      python3 - "${pty2}/prefix/etc/state.json" "${pty2}/prefix/etc/config.json" <<'PY' || rc=1
+import json,sys
+st=json.load(open(sys.argv[1],encoding="utf-8"))
+cfg=json.load(open(sys.argv[2],encoding="utf-8"))
+assert st["remark"]=="自定义端口节点"
+assert st["port"]==18445
+assert st["address"]=="38.127.180.103"
+assert st["method"]=="aes-128-gcm"
+assert st["password"]
+assert cfg["inbounds"][0]["port"]==18445
+print("交互自定义端口与落地地址写出通过")
+PY
+    fi
   fi
 
   info "测试换端口保留身份，以及失败回滚…"
