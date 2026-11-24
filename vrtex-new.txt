@@ -432,6 +432,8 @@ rules:
   - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
   - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
   - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
+  - DOMAIN-SUFFIX,dl.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,googleapis.com,♊ Gemini
   - RULE-SET,Gemini,♊ Gemini
 
   # ChatGPT / OpenAI 系
