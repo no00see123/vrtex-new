@@ -62,6 +62,12 @@ proxy-groups:
       - "🚀 手动切换"
       - "REJECT"
 
+- name: "🧠 Muse"
+    type: select
+    proxies:
+      - "🚀 手动切换"
+      - "REJECT"
+
   - name: "🤖 ChatGPT"
     type: select
     proxies:
@@ -212,6 +218,12 @@ rule-providers:
     interval: 86400
     type: http
     url: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Gemini/Gemini.list
+  MetaAI:
+    type: http
+    behavior: classical
+    format: text
+    interval: 86400
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/classical/meta.list
   LocalAreaNetwork:
     behavior: classical
     format: text
@@ -451,6 +463,12 @@ rules:
   - DOMAIN-SUFFIX,dl.google.com,♊ Gemini
   - DOMAIN-SUFFIX,googleapis.com,♊ Gemini
   - RULE-SET,Gemini,♊ Gemini
+
+  # Muse (Meta AI)
+  - DOMAIN-SUFFIX,muse.ai,🧠 Muse
+  - DOMAIN-SUFFIX,meta.ai,🧠 Muse
+  - DOMAIN-SUFFIX,metaaiusercontent.com,🧠 Muse
+  - RULE-SET,MetaAI,🧠 Muse
 
   # ChatGPT / OpenAI 系
   - PROCESS-NAME,ChatGPT.exe,🤖 ChatGPT
