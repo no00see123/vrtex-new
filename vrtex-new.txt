@@ -500,7 +500,6 @@ rules:
 
   - DOMAIN-SUFFIX,xiaohongshu.com,DIRECT
   - DOMAIN-SUFFIX,xhscdn.com,DIRECT
-  - DOMAIN-SUFFIX,goofish.com,DIRECT
 
   - RULE-SET,Riot,DIRECT
   - PROCESS-NAME,WeGame.exe,DIRECT
@@ -512,7 +511,6 @@ rules:
   - PROCESS-NAME,RiotClientServices.exe,DIRECT
   - DOMAIN-SUFFIX,qorbentaxil.cc,DIRECT
   - DOMAIN-SUFFIX,fluvenkarthon.info,DIRECT
-  - PROCESS-NAME,LeagueClientUx.exe,DIRECT
   - PROCESS-NAME,LeagueClientUxRender.exe,DIRECT
   - PROCESS-NAME,browser.exe,DIRECT
 
