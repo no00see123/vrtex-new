@@ -62,7 +62,7 @@ proxy-groups:
       - "🚀 手动切换"
       - "REJECT"
 
-- name: "🧠 Muse"
+  - name: "🧠 Muse"
     type: select
     proxies:
       - "🚀 手动切换"
