@@ -412,7 +412,6 @@ rules:
   # 代理流量禁用 QUIC（国内 UDP 443 不受影响）
   - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
 
-  - RULE-SET,UnBan,DIRECT
   - RULE-SET,BanAD,🛑 广告拦截
   - RULE-SET,BanProgramAD,🍃 应用净化
 
@@ -425,6 +424,15 @@ rules:
   # ===== AI 客户端进程强制进组（桌面版 + CLI）=====
   - PROCESS-NAME,claude.exe,✴️Claude
   - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,✴️Claude'
+
+  # Gemini
+  - PROCESS-NAME,Gemini.exe,♊ Gemini
+  - PROCESS-NAME,gemini.exe,♊ Gemini
+  - PROCESS-NAME,gemini-cli.exe,♊ Gemini
+  - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
+  - RULE-SET,Gemini,♊ Gemini
 
   # ChatGPT / OpenAI 系
   - PROCESS-NAME,ChatGPT.exe,🤖 ChatGPT
@@ -441,15 +449,6 @@ rules:
   - DOMAIN-SUFFIX,twimg.com,✖️ Grok
   - DOMAIN-SUFFIX,t.co,✖️ Grok
 
-  # Gemini
-  - PROCESS-NAME,Gemini.exe,♊ Gemini
-  - PROCESS-NAME,gemini.exe,♊ Gemini
-  - PROCESS-NAME,gemini-cli.exe,♊ Gemini
-  - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
-  - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
-  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
-  - RULE-SET,Gemini,♊ Gemini
-
   # 多模型 AI 工具（进手动切换，因为它就是给 AI 用的）
   - PROCESS-NAME,Cursor.exe,🚀 手动切换
   - PROCESS-NAME,cursor.exe,🚀 手动切换
@@ -459,6 +458,7 @@ rules:
   - PROCESS-NAME,Antigravity.exe,🚀 手动切换
   - PROCESS-NAME,antigravity.exe,🚀 手动切换
 
+  - RULE-SET,UnBan,DIRECT
   - RULE-SET,LocalAreaNetwork,DIRECT
   - PROCESS-NAME,termius.exe,DIRECT
 
