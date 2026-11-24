@@ -176,6 +176,18 @@ proxy-groups:
       - "🚀 节点选择"
 
 rule-providers:
+  my_proxy:
+    type: http
+    behavior: classical
+    format: text
+    interval: 86400
+    url: https://raw.githubusercontent.com/no00see123/vrtex-new/refs/heads/main/my_proxy
+  my_direct:
+    type: http
+    behavior: classical
+    format: text
+    interval: 86400
+    url: https://raw.githubusercontent.com/no00see123/vrtex-new/refs/heads/main/my_direct
   BlockHttpDNS:
     type: http
     behavior: classical
@@ -400,6 +412,10 @@ rule-providers:
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Sony.list
 
 rules:
+#自维护特例分流规则集
+  - RULE-SET,my_proxy,🚀 节点选择
+  - RULE-SET,my_direct,DIRECT
+
 # WebRTC 防真实 IP：国内通话放行，境外 STUN 拦截
   - AND,((NETWORK,UDP),(DST-PORT,3478),(GEOIP,CN)),DIRECT
   - AND,((NETWORK,UDP),(DST-PORT,5349),(GEOIP,CN)),DIRECT
