@@ -424,88 +424,88 @@ rule-providers:
     url: https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/Sony.list
 
 rules:
-#自维护特例分流规则集
-- RULE-SET,my_proxy,🚀 节点选择
-- RULE-SET,my_direct,DIRECT
+  # 自维护特例分流规则集
+  - RULE-SET,my_proxy,🚀 节点选择
+  - RULE-SET,my_direct,DIRECT
 
-# DNS 防泄露与禁用 QUIC 留在最顶部（禁用 QUIC 会让流量回退到更稳定的 TCP 443，不影响 AI）
-- RULE-SET,BlockHttpDNS,🧱 DNS防泄露
-- AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
+  # DNS 防泄露与禁用 QUIC 留在最顶部（禁用 QUIC 会让流量回退到更稳定的 TCP 443，不影响 AI）
+  - RULE-SET,BlockHttpDNS,🧱 DNS防泄露
+  - AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((GEOIP,CN)))),REJECT
 
-- RULE-SET,BanAD,🛑 广告拦截
-- RULE-SET,BanProgramAD,🍃 应用净化
+  - RULE-SET,BanAD,🛑 广告拦截
+  - RULE-SET,BanProgramAD,🍃 应用净化
 
   # Claude
-- DOMAIN-SUFFIX,claude.ai,✴️Claude
-- DOMAIN-SUFFIX,claude.com,✴️Claude
-- DOMAIN-SUFFIX,anthropic.com,✴️Claude
-- DOMAIN-SUFFIX,claudeusercontent.com,✴️Claude
-- RULE-SET,Claude,✴️Claude
+  - DOMAIN-SUFFIX,claude.ai,✴️Claude
+  - DOMAIN-SUFFIX,claude.com,✴️Claude
+  - DOMAIN-SUFFIX,anthropic.com,✴️Claude
+  - DOMAIN-SUFFIX,claudeusercontent.com,✴️Claude
+  - RULE-SET,Claude,✴️Claude
   # ===== AI 客户端进程强制进组（桌面版 + CLI）=====
-- PROCESS-NAME,claude.exe,✴️Claude
-- 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,✴️Claude'
+  - PROCESS-NAME,claude.exe,✴️Claude
+  - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,✴️Claude'
 
   # Gemini
-- PROCESS-NAME,Gemini.exe,♊ Gemini
-- PROCESS-NAME,gemini.exe,♊ Gemini
-- PROCESS-NAME,gemini-cli.exe,♊ Gemini
-- DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
-- DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
-- DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
-- DOMAIN-SUFFIX,dl.google.com,♊ Gemini
-- DOMAIN-SUFFIX,googleapis.com,♊ Gemini
-- RULE-SET,Gemini,♊ Gemini
+  - PROCESS-NAME,Gemini.exe,♊ Gemini
+  - PROCESS-NAME,gemini.exe,♊ Gemini
+  - PROCESS-NAME,gemini-cli.exe,♊ Gemini
+  - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
+  - DOMAIN-SUFFIX,dl.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,googleapis.com,♊ Gemini
+  - RULE-SET,Gemini,♊ Gemini
 
   # Muse (Meta AI) —— 补充了抓包日志中的核心及实时语音域名
-- DOMAIN-SUFFIX,muse.ai,🧠 Muse
-- DOMAIN-SUFFIX,meta.ai,🧠 Muse
-- DOMAIN-SUFFIX,meta.com,🧠 Muse
-- DOMAIN-SUFFIX,metaaivm.com,🧠 Muse
-- DOMAIN-SUFFIX,metaaiusercontent.com,🧠 Muse
-- DOMAIN,meta-ai-realtime.facebook.com,🧠 Muse
-- DOMAIN,edge-stun.facebook.com,🧠 Muse
-- RULE-SET,MetaAI,🧠 Muse
+  - DOMAIN-SUFFIX,muse.ai,🧠 Muse
+  - DOMAIN-SUFFIX,meta.ai,🧠 Muse
+  - DOMAIN-SUFFIX,meta.com,🧠 Muse
+  - DOMAIN-SUFFIX,metaaivm.com,🧠 Muse
+  - DOMAIN-SUFFIX,metaaiusercontent.com,🧠 Muse
+  - DOMAIN,meta-ai-realtime.facebook.com,🧠 Muse
+  - DOMAIN,edge-stun.facebook.com,🧠 Muse
+  - RULE-SET,MetaAI,🧠 Muse
 
   # ChatGPT / OpenAI 系
-- PROCESS-NAME,ChatGPT.exe,🤖 ChatGPT
-- PROCESS-NAME,chatgpt.exe,🤖 ChatGPT
-- PROCESS-NAME,codex.exe,🤖 ChatGPT
-- PROCESS-NAME,copilot.exe,🤖 ChatGPT
-- RULE-SET,OpenAI,🤖 ChatGPT
+  - PROCESS-NAME,ChatGPT.exe,🤖 ChatGPT
+  - PROCESS-NAME,chatgpt.exe,🤖 ChatGPT
+  - PROCESS-NAME,codex.exe,🤖 ChatGPT
+  - PROCESS-NAME,copilot.exe,🤖 ChatGPT
+  - RULE-SET,OpenAI,🤖 ChatGPT
 
   # Grok
-- PROCESS-NAME,grok.exe,✖️ Grok
-- DOMAIN-SUFFIX,x.ai,✖️ Grok
-- DOMAIN-SUFFIX,grok.com,✖️ Grok
-- DOMAIN-SUFFIX,twitter.com,✖️ Grok
-- DOMAIN-SUFFIX,twimg.com,✖️ Grok
-- DOMAIN-SUFFIX,t.co,✖️ Grok
+  - PROCESS-NAME,grok.exe,✖️ Grok
+  - DOMAIN-SUFFIX,x.ai,✖️ Grok
+  - DOMAIN-SUFFIX,grok.com,✖️ Grok
+  - DOMAIN-SUFFIX,twitter.com,✖️ Grok
+  - DOMAIN-SUFFIX,twimg.com,✖️ Grok
+  - DOMAIN-SUFFIX,t.co,✖️ Grok
 
   # 多模型 AI 工具（进手动切换，因为它就是给 AI 用的）
-- PROCESS-NAME,Cursor.exe,🚀 手动切换
-- PROCESS-NAME,cursor.exe,🚀 手动切换
-- PROCESS-NAME,Code.exe,🚀 手动切换
-- PROCESS-NAME,Windsurf.exe,🚀 手动切换
-- PROCESS-NAME,windsurf.exe,🚀 手动切换
-- PROCESS-NAME,Antigravity.exe,🚀 手动切换
-- PROCESS-NAME,antigravity.exe,🚀 手动切换
+  - PROCESS-NAME,Cursor.exe,🚀 手动切换
+  - PROCESS-NAME,cursor.exe,🚀 手动切换
+  - PROCESS-NAME,Code.exe,🚀 手动切换
+  - PROCESS-NAME,Windsurf.exe,🚀 手动切换
+  - PROCESS-NAME,windsurf.exe,🚀 手动切换
+  - PROCESS-NAME,Antigravity.exe,🚀 手动切换
+  - PROCESS-NAME,antigravity.exe,🚀 手动切换
 
-# WebRTC 防真实 IP（移到所有 AI 规则之后，只拦截普通网页的泄露）
-- AND,((NETWORK,UDP),(DST-PORT,3478),(GEOIP,CN)),DIRECT
-- AND,((NETWORK,UDP),(DST-PORT,5349),(GEOIP,CN)),DIRECT
-- AND,((NETWORK,UDP),(DST-PORT,19302-19309),(GEOIP,CN)),DIRECT
-- AND,((NETWORK,UDP),(DST-PORT,3478)),🛡️ WebRTC防泄露
-- AND,((NETWORK,UDP),(DST-PORT,5349)),🛡️ WebRTC防泄露
-- AND,((NETWORK,UDP),(DST-PORT,19302-19309)),🛡️ WebRTC防泄露
+  # WebRTC 防真实 IP（移到所有 AI 规则之后，只拦截普通网页的泄露）
+  - AND,((NETWORK,UDP),(DST-PORT,3478),(GEOIP,CN)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,5349),(GEOIP,CN)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,19302-19309),(GEOIP,CN)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,3478)),🛡️ WebRTC防泄露
+  - AND,((NETWORK,UDP),(DST-PORT,5349)),🛡️ WebRTC防泄露
+  - AND,((NETWORK,UDP),(DST-PORT,19302-19309)),🛡️ WebRTC防泄露
 
-- RULE-SET,UnBan,DIRECT
-- RULE-SET,LocalAreaNetwork,DIRECT
-- PROCESS-NAME,termius.exe,DIRECT
+  - RULE-SET,UnBan,DIRECT
+  - RULE-SET,LocalAreaNetwork,DIRECT
+  - PROCESS-NAME,termius.exe,DIRECT
 
-- RULE-SET,GoogleFCM,📢 谷歌FCM
-- RULE-SET,GoogleCN,DIRECT
-- RULE-SET,SteamCN,DIRECT
-- RULE-SET,ByteDance,DIRECT
+  - RULE-SET,GoogleFCM,📢 谷歌FCM
+  - RULE-SET,GoogleCN,DIRECT
+  - RULE-SET,SteamCN,DIRECT
+  - RULE-SET,ByteDance,DIRECT
 
   - DOMAIN-SUFFIX,goofish.com,DIRECT
   - RULE-SET,58TongCheng,DIRECT
@@ -535,7 +535,6 @@ rules:
   - DOMAIN-SUFFIX,fluvenkarthon.info,DIRECT
   - PROCESS-NAME,LeagueClientUxRender.exe,DIRECT
   - PROCESS-NAME,browser.exe,DIRECT
-
 
   - RULE-SET,Kuaishou,DIRECT
   - RULE-SET,Alibaba,DIRECT
