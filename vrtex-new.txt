@@ -481,13 +481,15 @@ rules:
   - PROCESS-NAME,copilot.exe,🤖 ChatGPT
   - RULE-SET,OpenAI,🤖 ChatGPT
 
-  # Grok
+  # Grok  已抓包
   - PROCESS-NAME,grok.exe,✖️ Grok
   - DOMAIN-SUFFIX,x.ai,✖️ Grok
   - DOMAIN-SUFFIX,grok.com,✖️ Grok
   - DOMAIN-SUFFIX,twitter.com,✖️ Grok
   - DOMAIN-SUFFIX,twimg.com,✖️ Grok
   - DOMAIN-SUFFIX,t.co,✖️ Grok
+  - DOMAIN-SUFFIX,grok.me,✖️ Grok
+  - DOMAIN-SUFFIX,onetrust.com,✖️ Grok
 
   # 多模型 AI 工具（进手动切换，因为它就是给 AI 用的）
   - PROCESS-NAME,Cursor.exe,🚀 手动切换
