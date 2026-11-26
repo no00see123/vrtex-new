@@ -445,15 +445,23 @@ rules:
   - PROCESS-NAME,claude.exe,✴️Claude
   - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,✴️Claude'
 
-  # Gemini
+# Gemini
   - PROCESS-NAME,Gemini.exe,♊ Gemini
   - PROCESS-NAME,gemini.exe,♊ Gemini
   - PROCESS-NAME,gemini-cli.exe,♊ Gemini
   - DOMAIN-SUFFIX,gemini.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,bard.google.com,♊ Gemini
   - DOMAIN-SUFFIX,aistudio.google.com,♊ Gemini
+  - DOMAIN-SUFFIX,makersuite.google.com,♊ Gemini
   - DOMAIN-SUFFIX,generativelanguage.googleapis.com,♊ Gemini
+  - DOMAIN-SUFFIX,alkalimakersuite-pa.clients6.google.com,♊ Gemini
+  - DOMAIN,robinfrontend-pa.googleapis.com,♊ Gemini
+  - DOMAIN,accountcapabilities-pa.googleapis.com,♊ Gemini
+  - DOMAIN,subscriptionsfirstparty-pa.googleapis.com,♊ Gemini
+  - DOMAIN,subscriptionsmobile-pa.googleapis.com,♊ Gemini
+  - DOMAIN,signaler-pa.googleapis.com,♊ Gemini
+  - DOMAIN,push.clients6.google.com,♊ Gemini
   - DOMAIN-SUFFIX,dl.google.com,♊ Gemini
-  - DOMAIN-SUFFIX,googleapis.com,♊ Gemini
   - RULE-SET,Gemini,♊ Gemini
 
   # Muse (Meta AI) —— 补充了抓包日志中的核心及实时语音域名
