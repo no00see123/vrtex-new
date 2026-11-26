@@ -440,6 +440,10 @@ rules:
   - DOMAIN-SUFFIX,claude.com,✴️Claude
   - DOMAIN-SUFFIX,anthropic.com,✴️Claude
   - DOMAIN-SUFFIX,claudeusercontent.com,✴️Claude
+  - DOMAIN-SUFFIX,siftscience.com,✴️Claude
+  - DOMAIN-SUFFIX,datadoghq.com,✴️Claude
+  - DOMAIN,0.datadog.pool.ntp.org,✴️Claude
+  - DOMAIN,ca.iadsdk.apple.com,✴️Claude
   - RULE-SET,Claude,✴️Claude
   # ===== AI 客户端进程强制进组（桌面版 + CLI）=====
   - PROCESS-NAME,claude.exe,✴️Claude
