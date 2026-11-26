@@ -445,7 +445,7 @@ rules:
   - PROCESS-NAME,claude.exe,✴️Claude
   - 'PROCESS-PATH-REGEX,(?i)^C:\\Program Files\\WindowsApps\\Claude_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+_x64__pzs8sxrjxfjjc\\.+[.]exe$,✴️Claude'
 
-# Gemini
+# Gemini 已抓包
   - PROCESS-NAME,Gemini.exe,♊ Gemini
   - PROCESS-NAME,gemini.exe,♊ Gemini
   - PROCESS-NAME,gemini-cli.exe,♊ Gemini
@@ -464,7 +464,7 @@ rules:
   - DOMAIN-SUFFIX,dl.google.com,♊ Gemini
   - RULE-SET,Gemini,♊ Gemini
 
-  # Muse (Meta AI) —— 补充了抓包日志中的核心及实时语音域名
+  # Muse (Meta AI) —— 已抓包
   - DOMAIN-SUFFIX,muse.ai,🧠 Muse
   - DOMAIN-SUFFIX,meta.ai,🧠 Muse
   - DOMAIN-SUFFIX,meta.com,🧠 Muse
